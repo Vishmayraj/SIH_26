@@ -97,10 +97,46 @@ only ever has the phone's IMU at inference time anyway. `03_window.py`
 builds inputs from `s_*` columns and labels from `v_*` (ground truth)
 columns; see that script's module docstring.
 
-Implemented in `03_window.py`: `alignment_net`, `channel_a_velocity`
-(Section 12's stated Person-A priority order) - both now windowed,
-normalized, and leakage-checked against real data as recorded above.
 `channel_b_velocity`, `road_signature`, `calibration_adapter` have
 window configs defined but no label-derivation function yet -
 road-signature in particular needs a per-corridor OSM segment map
 (Section 6) that doesn't exist yet, not just this dataset.
+
+**Phase 1 update (15 Sep 2026):** `build_channel_b` and
+`build_road_signature` have now been implemented in `03_window.py`.
+
+To generate Channel B and road-signature windows, run from the repo root:
+
+```bash
+python data/scripts/03_window.py --model channel_b_velocity
+python data/scripts/04_normalize.py --model channel_b_velocity
+
+python data/scripts/03_window.py --model road_signature
+# road_signature labels do NOT need a separate normalize step (integer segment IDs, not floats)
+```
+
+Channel B expected output: ~37K train / ~6.8K val / ~23K test windows,
+shape (400, 3) — same session count as channel_a_velocity, different
+window size (4s vs 2s) and channel count (3 accel only vs 6 accel+gyro).
+
+Road signature expected output: similar count to channel_a_velocity
+but with integer labels (route-relative segment IDs from GPS arc-length
+binned at 75m). These are route-relative IDs suitable for the IO-VNBD
+hackathon demo; global cross-corridor IDs need the secondary Indian
+drive dataset (MIP Section 3.1).
+
+**Rotation augmentation (Phase 1.3 / DVSE deviation):** to add random
+phone-mount angle augmentation to the train split, add `--augment-rotation`:
+
+```bash
+python data/scripts/03_window.py --model channel_a_velocity --augment-rotation
+python data/scripts/03_window.py --model channel_b_velocity --augment-rotation
+```
+
+This doubles the train set size (original + rotated copies). Record RMSE
+before/after in the final report deviation table. Off by default.
+
+`calibration_adapter` still has no builder — it requires a real Indian
+vehicle calibration-drive session (MIP Section 4.5 "secondary dataset"),
+not IO-VNBD data. Use the two-scalar closed-form fallback (MIP Section 14)
+until that data is collected.

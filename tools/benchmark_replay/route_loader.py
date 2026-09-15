@@ -6,14 +6,14 @@ empty as of this writing (Layer 1 hasn't run Section 3 yet), so the
 only usable source right now is a synthetic route - a straight-line or
 constant-turn trajectory with synthetic ground truth and synthetic
 IMU-like noise, in the same spirit as the fusion-core unit tests in
-Section 11.2. Swap to `load_io_vnbd_route` the moment
-`data/processed/` has something real; coordinate with Layer 1 on the
-exact file format they land on before wiring it up for real.
+Section 11.2. Swap to `load_io_vnbd_route` once `data/processed/` has
+something real; coordinate with Layer 1 on the exact file format they
+land on before wiring it up for real.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -41,9 +41,48 @@ class Route:
     gyro_yaw: np.ndarray  # (N,) synthetic/measured yaw rate, rad/s, WITH noise
     gnss_available: np.ndarray  # (N,) bool, True unless a blackout.py mask has been applied
 
+    # Raw 6-channel IMU (Phase 4): (N, 6) float32 — [accel_x, accel_y, accel_z,
+    # gyro_yaw, gyro_pitch, gyro_roll] in body frame at 100Hz.
+    # Used by RealVelocityEstimator.estimate() to build input windows on the fly.
+    # For synthetic routes, synthesized from accel_body + gyro_yaw; for real IO-VNBD
+    # routes, loaded directly from the S-stream _aligned.parquet.
+    imu_raw: np.ndarray = field(default_factory=lambda: np.empty((0, 6), dtype=np.float32))
+
     @property
     def n_steps(self) -> int:
         return len(self.t)
+
+    def get_imu_window(self, i: int, window_len: int = 200,
+                       n_imu_channels: int = 6) -> np.ndarray:
+        """Build a raw (not normalized) IMU window of shape (window_len, n_imu_channels)
+        ending at step i (inclusive).
+
+        Zero-pads at the start of the route where insufficient history exists.
+        This matches the 03_window.py make_windows() convention.
+
+        Args:
+            i:               current route step index (0-indexed).
+            window_len:      timesteps in window (200 for Channel A, 400 for Channel B).
+            n_imu_channels:  IMU channels to return (6 for Channel A, 3 for Channel B).
+
+        Returns:
+            (window_len, n_imu_channels) float32, raw (not normalized).
+        """
+        if len(self.imu_raw) == 0:
+            # Synthetic routes don't populate imu_raw; synthesize from existing fields.
+            synthetic_imu = np.zeros((len(self.t), 6), dtype=np.float32)
+            synthetic_imu[:, :2] = self.accel_body.astype(np.float32)  # ax, ay
+            synthetic_imu[:, 3]  = self.gyro_yaw.astype(np.float32)    # gyro_yaw
+            raw = synthetic_imu
+        else:
+            raw = self.imu_raw
+
+        start = max(0, i - window_len + 1)
+        chunk = raw[start : i + 1, :n_imu_channels]  # (≤window_len, n_imu_channels)
+        if len(chunk) < window_len:
+            pad = np.zeros((window_len - len(chunk), n_imu_channels), dtype=np.float32)
+            chunk = np.concatenate([pad, chunk], axis=0)
+        return chunk.astype(np.float32)
 
 
 def generate_synthetic_route(

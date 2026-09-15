@@ -48,21 +48,57 @@ class DummyVelocityEstimator:
 
 
 class RealVelocityEstimator:
-    """Placeholder for the trained Channel A / Channel B ONNX model
-    (MIP Section 4.2 / 4.3). Not implemented: no exported model exists
-    yet under models/channel_a_velocity/ or models/channel_b_velocity/.
-    Swap this in once Layer 1 has a first working export - it should
-    load the ONNX model + models/common/normalization.py stats and run
-    inference on the current input window.
+    """Trained Channel A or Channel B ONNX velocity model (MIP Section 4.2 / 4.3).
+
+    Loads the exported INT8 (or FP32 fallback) ONNX model plus its
+    norm_stats.json and runs inference on the raw IMU window ending at
+    each route step. Norm stats are applied at inference time, matching
+    the Dataset.__getitem__ convention in models/*/dataset.py.
+
+    delta_v_mode (Phase 2.1 deviation from MIP Section 4.2):
+        If the model was trained on Δv labels (--delta-v flag in 03_window.py),
+        set delta_v_mode=True. The estimator then accumulates Δv predictions
+        into a running velocity estimate that it returns. The UKF receives this
+        running estimate, NOT the Δv directly.
+        If False (default, absolute velocity mode), model output is returned as-is.
     """
 
-    def __init__(self, *_args, **_kwargs) -> None:
-        raise NotImplementedError(
-            "Real Channel A/B estimator not implemented yet - no exported "
-            "model exists under models/channel_a_velocity/ or "
-            "models/channel_b_velocity/. Use components.channel_a: dummy "
-            "(or channel_b: dummy) in config.yaml until Layer 1 delivers one."
-        )
+    def __init__(self,
+                 onnx_path: str,
+                 norm_stats_path: str,
+                 window_len: int = 200,
+                 n_imu_channels: int = 6,
+                 delta_v_mode: bool = False) -> None:
+        import json
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(onnx_path,
+                                            providers=["CUDAExecutionProvider",
+                                                       "CPUExecutionProvider"])
+        stats = json.loads(open(norm_stats_path).read())
+        self.mean = np.array(stats["mean"], dtype=np.float32)  # (n_imu_channels,)
+        self.std  = np.array(stats["std"],  dtype=np.float32)  # (n_imu_channels,)
+        self.input_name = self.session.get_inputs()[0].name
+        self.window_len = window_len
+        self.n_imu_channels = n_imu_channels
+        self.delta_v_mode = delta_v_mode
+        self._v_running = 0.0  # accumulated velocity (delta_v_mode only)
+
+    def estimate(self, route, i: int) -> float:
+        """Run inference and return forward speed estimate (m/s) at step i."""
+        window = route.get_imu_window(i, self.window_len, self.n_imu_channels)
+        # Normalize: (T, C) raw -> apply mean/std -> (C, T) channels-first
+        norm = (window - self.mean) / (self.std + 1e-8)  # (T, C)
+        x = norm.T[np.newaxis].astype(np.float32)         # (1, C, T)
+        out = self.session.run(None, {self.input_name: x})[0]
+        pred = float(out[0, 0])
+        if self.delta_v_mode:
+            self._v_running += pred
+            return max(0.0, self._v_running)  # velocity can't be negative
+        return pred
+
+    def reset(self) -> None:
+        """Reset the running velocity accumulator (call at route start)."""
+        self._v_running = 0.0
 
 
 # --- Road-signature drift-anchor classifier ---------------------------------
@@ -281,17 +317,38 @@ class DummyMapMatcher:
 
 
 class RealHmmMapMatcher:
-    """Placeholder for map_matching/hmm/ (MIP Section 6), which itself
-    needs an OSM extract for at least one real corridor before it can
-    run for real (Section 12, Layer 2 Person B picks this up after
-    this tool)."""
+    """HMM/Viterbi map-matcher (MIP Section 6) backed by an OSM road graph.
 
-    def __init__(self, *_args, **_kwargs) -> None:
-        raise NotImplementedError(
-            "Real HMM map-matcher not implemented yet - map_matching/hmm/ "
-            "has no OSM extract wired up. Use components.map_matching: "
-            "dummy in config.yaml until Layer 2 Person B delivers one."
-        )
+    Implemented in map_matching/hmm/viterbi_matcher.py (Phase 5 of the
+    implementation plan). This wrapper loads that module and delegates
+    to it. If the OSM graph file doesn't exist yet, raises a clear error
+    pointing to the extraction script.
+    """
+
+    def __init__(self, graph_path: str,
+                 window_size: int = 15,
+                 sigma_emit_m: float = 10.0,
+                 beta_transition: float = 10.0) -> None:
+        try:
+            from map_matching.hmm.viterbi_matcher import ViterbiMapMatcher
+            self._matcher = ViterbiMapMatcher(
+                graph_path=graph_path,
+                window_size=window_size,
+                sigma_emit_m=sigma_emit_m,
+                beta_transition=beta_transition,
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"OSM graph file not found: {graph_path}\n"
+                "Run: python map_matching/osm_extraction/extract.py\n"
+                "to generate it at build time (not at runtime)."
+            )
+
+    def snap(self, pos: np.ndarray) -> np.ndarray:
+        """pos: (2,) [north_m, east_m] in local flat-earth frame.
+        Returns snapped (2,) position in the same frame.
+        """
+        return self._matcher.snap(pos)
 
 
 # --- Component factory --------------------------------------------------------
@@ -309,22 +366,64 @@ class ComponentSet:
 
 def build_components(config: dict) -> ComponentSet:
     """Instantiate the five components per config.yaml's
-    `components.*: dummy|real` switches. Raises NotImplementedError
-    with a clear pointer if a `real` component is requested before it
-    exists - see each Real* class's docstring above."""
+    `components.*: dummy|real` switches.
+
+    config.yaml conventions for 'real' components (Phase 4):
+      components:
+        channel_a: real
+        channel_b: real
+        road_signature: dummy
+        fusion: real
+        map_matching: dummy
+
+      # Required when channel_a/channel_b: real
+      channel_a:
+        onnx_path: models/channel_a_velocity/exported/channel_a.onnx
+        norm_stats_path: data/processed/channel_a_velocity/norm_stats.json
+        window_len: 200          # 2s @ 100Hz
+        n_imu_channels: 6        # accel xyz + gyro xyz
+        delta_v_mode: false      # true if model was trained with --delta-v
+      channel_b:
+        onnx_path: models/channel_b_velocity/exported/channel_b.onnx
+        norm_stats_path: data/processed/channel_b_velocity/norm_stats.json
+        window_len: 400          # 4s @ 100Hz
+        n_imu_channels: 3        # accel xyz only
+        delta_v_mode: false
+
+      # Required when map_matching: real
+      map_matching:
+        graph_path: map_matching/osm_extraction/corridor.graphml
+        window_size: 15
+        sigma_emit_m: 10.0
+        beta_transition: 10.0
+    """
     which = config["components"]
     threshold = config.get("road_signature_confidence_threshold", 0.85)
 
-    channel_a = (
-        DummyVelocityEstimator(seed=1)
-        if which["channel_a"] == "dummy"
-        else RealVelocityEstimator()
-    )
-    channel_b = (
-        DummyVelocityEstimator(seed=2)
-        if which["channel_b"] == "dummy"
-        else RealVelocityEstimator()
-    )
+    if which["channel_a"] == "dummy":
+        channel_a = DummyVelocityEstimator(seed=1)
+    else:
+        ca_cfg = config.get("channel_a", {})
+        channel_a = RealVelocityEstimator(
+            onnx_path=ca_cfg.get("onnx_path", "models/channel_a_velocity/exported/channel_a.onnx"),
+            norm_stats_path=ca_cfg.get("norm_stats_path", "data/processed/channel_a_velocity/norm_stats.json"),
+            window_len=ca_cfg.get("window_len", 200),
+            n_imu_channels=ca_cfg.get("n_imu_channels", 6),
+            delta_v_mode=ca_cfg.get("delta_v_mode", False),
+        )
+
+    if which["channel_b"] == "dummy":
+        channel_b = DummyVelocityEstimator(seed=2)
+    else:
+        cb_cfg = config.get("channel_b", {})
+        channel_b = RealVelocityEstimator(
+            onnx_path=cb_cfg.get("onnx_path", "models/channel_b_velocity/exported/channel_b.onnx"),
+            norm_stats_path=cb_cfg.get("norm_stats_path", "data/processed/channel_b_velocity/norm_stats.json"),
+            window_len=cb_cfg.get("window_len", 400),
+            n_imu_channels=cb_cfg.get("n_imu_channels", 3),
+            delta_v_mode=cb_cfg.get("delta_v_mode", False),
+        )
+
     road_signature = (
         DummyRoadSignatureEstimator(confidence_threshold=threshold)
         if which["road_signature"] == "dummy"
@@ -335,11 +434,16 @@ def build_components(config: dict) -> ComponentSet:
         if which["fusion"] == "dummy"
         else RealUkfFusion(road_signature_confidence_threshold=threshold)
     )
-    map_matching = (
-        DummyMapMatcher()
-        if which["map_matching"] == "dummy"
-        else RealHmmMapMatcher()
-    )
+    if which["map_matching"] == "dummy":
+        map_matching = DummyMapMatcher()
+    else:
+        mm_cfg = config.get("map_matching", {})
+        map_matching = RealHmmMapMatcher(
+            graph_path=mm_cfg.get("graph_path", "map_matching/osm_extraction/corridor.graphml"),
+            window_size=mm_cfg.get("window_size", 15),
+            sigma_emit_m=mm_cfg.get("sigma_emit_m", 10.0),
+            beta_transition=mm_cfg.get("beta_transition", 10.0),
+        )
 
     return ComponentSet(
         channel_a=channel_a,

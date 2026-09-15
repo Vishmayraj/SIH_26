@@ -68,12 +68,25 @@ def main(config_path: str):
     val_loader = DataLoader(val_ds, batch_size=cfg["train"]["batch_size"])
 
     module = ChannelAModule(cfg)
+    checkpoint = pl.callbacks.ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        filename="best-{epoch:02d}-{val_loss:.4f}",
+    )
     trainer = pl.Trainer(
         max_epochs=cfg["train"]["epochs"],
         gradient_clip_val=cfg["train"]["gradient_clip_max_norm"],
-        callbacks=[pl.callbacks.EarlyStopping(monitor="val_loss", patience=cfg["train"]["early_stopping_patience"])],
+        callbacks=[
+            pl.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=cfg["train"]["early_stopping_patience"],
+            ),
+            checkpoint,
+        ],
     )
     trainer.fit(module, train_loader, val_loader)
+    print(f"best_checkpoint={checkpoint.best_model_path}")
 
 
 if __name__ == "__main__":

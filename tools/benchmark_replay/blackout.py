@@ -53,6 +53,7 @@ def apply_blackout(route: Route, window: BlackoutWindow) -> Route:
         accel_body=route.accel_body,
         gyro_yaw=route.gyro_yaw,
         gnss_available=gnss_available,
+        imu_raw=route.imu_raw,  # pass through (Phase 4: new field on Route)
     )
 
 
