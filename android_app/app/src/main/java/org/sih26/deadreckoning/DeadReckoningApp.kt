@@ -18,7 +18,7 @@ class DeadReckoningApp : Application() {
         super.onCreate()
         Configuration.getInstance().load(this, getSharedPreferences("osmdroid", MODE_PRIVATE))
         Configuration.getInstance().osmdroidBasePath = getDir("osmdroid", MODE_PRIVATE)
-        Configuration.getInstance().osmdroidTileCache = getDir("osmdroid/tiles", MODE_PRIVATE)
+        Configuration.getInstance().osmdroidTileCache = getDir("osmdroid", MODE_PRIVATE)
         Configuration.getInstance().userAgentValue = packageName
     }
 }
