@@ -17,12 +17,21 @@ import kotlin.math.max
  *     onImu (100 Hz)  -> leveling -> horizontal accel + yaw rate
  *                     -> ZUPT detector
  *                     -> Channel P integration, Stage 12 model (if injected)
+ *                     -> Corridor road-matching (if injected), reading whatever
+ *                        speed/yaw Channel A settled on this cycle
  *                     -> UKF step
  *     onGnss (1 Hz)   -> staged for the next IMU cycle, or withheld if blacked out
+ *                     -> also kicks off CorridorChannel's one-shot road-network fetch
  *
  * Stage 12 (models/stage12/motion_speed_net.py, bridged via [Stage12Channel]) only
  * takes Channel A's slot away from Channel P during a blackout, and only once its
  * pre-blackout calibration is trusted - see that class's doc for why.
+ *
+ * Corridor (tools/stage12/corridor_filter.py, bridged via [CorridorChannel]) tracks
+ * along a road-network polyline through a blackout using the same Channel A speed
+ * evidence, and only reaches the outer UKF as a position correction once its
+ * progress-anchor confidence clears [FusionConfig.roadSignatureConfidenceThreshold]
+ * - see that class's doc for the two-threshold reasoning.
  *
  * The blackout is a boolean gate on whether a fix reaches the filter. Fixes are
  * always received and always logged. That is the entire experiment: withheld fixes
@@ -56,6 +65,25 @@ data class FusionSnapshot(
      * actually fed into the UKF's Channel A slot - see Stage12Channel's class doc
      * for the blackout-gating rule. */
     val stage12Active: Boolean,
+    /** True once [CorridorChannel] has a candidate road chained and is tracking
+     * along it, independent of whether that track is currently confident enough
+     * to reach the outer UKF (see [corridorActive]). False before any blackout,
+     * after a blackout ends, or if the road-network fetch never completed / found
+     * nothing nearby. */
+    val corridorRoadLocked: Boolean,
+    /** [RoadProgressMatcher]'s progress-anchor confidence this cycle, 0 if no
+     * road is locked. Reported regardless of [corridorActive] so a field test can
+     * see the match quality even on cycles below the outer UKF's own threshold. */
+    val corridorConfidence: Double,
+    /** True on cycles where the corridor filter's road-snapped position actually
+     * reached the outer UKF as a position correction (confidence cleared
+     * [FusionConfig.roadSignatureConfidenceThreshold]) - see the call site in
+     * [onImu] for why this is a stricter gate than [corridorConfidence] alone. */
+    val corridorActive: Boolean,
+    /** Distance between the corridor filter's road-snapped position and the
+     * outer UKF's own pre-correction position estimate this cycle - how hard the
+     * road match is pulling, for display only. Null unless a road is locked on. */
+    val corridorPositionCorrectionM: Double?,
     val zuptActive: Boolean,
     val imuRateHz: Double,
     val stepLatencyMs: Double,
@@ -136,7 +164,14 @@ class FusionPipeline(
      * channel entirely and the pipeline behaves exactly as before - Channel P is
      * the only Channel A source, same as prior to this parameter's existence. The
      * Android-side ONNX-backed implementation lives in the sensors package. */
-    private val stage12Model: Stage12SpeedModel? = null
+    private val stage12Model: Stage12SpeedModel? = null,
+    /** Optional road-network provider for [CorridorChannel] (Mode F: Best Adaptive
+     * Hybrid). Null disables the channel entirely - same "injected, not
+     * constructed" reasoning as [stage12Model], and the same degrade-to-prior-
+     * behaviour guarantee: without it, this pipeline runs exactly as it did
+     * before corridor matching existed. The Android-side Overpass-backed
+     * implementation lives in the sensors package. */
+    roadNetworkProvider: RoadNetworkProvider? = null
 ) {
 
     var phase: PipelinePhase = PipelinePhase.LEVELING
@@ -177,6 +212,12 @@ class FusionPipeline(
      * [stage12Model] was null, or forever if it was supplied but leveling never
      * completes (which only happens if the session ends first). */
     private var stage12Channel: Stage12Channel? = null
+
+    /** Constructed eagerly (unlike [stage12Channel], which needs leveling first):
+     * [CorridorChannel] has no leveling dependency, only a first GNSS fix to kick
+     * off its road-network fetch. Null for the whole session if
+     * [roadNetworkProvider] was null. */
+    private val corridorChannel: CorridorChannel? = roadNetworkProvider?.let { CorridorChannel(it) }
 
     /** A second filter that receives no GNSS and no velocity channel during a
      * blackout: the honest "what the phone does today" CTCV coast. Having it on
@@ -247,8 +288,19 @@ class FusionPipeline(
             // Stage12Calibration's class doc for why this must not keep refitting
             // once blackout starts.
             stage12Channel?.onBlackoutStart()
+            // Lock a candidate road at the outer UKF's position the instant the
+            // blackout starts, seeded with whatever speed estimate is on hand -
+            // matches canonical_evaluate_v4.py's CorridorFilter(road, s_init=0.0,
+            // v_init=speeds[idx_start]).
+            if (current != null) {
+                corridorChannel?.onBlackoutStart(
+                    pos = doubleArrayOf(current.posN, current.posE),
+                    initialSpeed = current.speed
+                )
+            }
         } else {
             blackoutStartNs = null
+            corridorChannel?.onBlackoutEnd()
         }
     }
 
@@ -263,6 +315,11 @@ class FusionPipeline(
     fun onGnss(fix: GnssFix) {
         lastFix = fix
         if (localFrame == null) localFrame = LocalFrame(fix.latDeg, fix.lonDeg)
+        // Fires at most once per session - see CorridorChannel.onFirstFix's own
+        // idempotency guard. Kicked off here rather than waiting for RUNNING phase
+        // so the Overpass fetch has as much of the pre-blackout drive as possible
+        // to complete before the first blackout needs a locked road.
+        localFrame?.let { corridorChannel?.onFirstFix(fix.latDeg, fix.lonDeg, it) }
 
         if (blackout) {
             // Ground truth accounting continues through the blackout, using the
@@ -495,6 +552,34 @@ class FusionPipeline(
         }
         val finalGyroYaw = stage12Output?.correctedYawRateRadS ?: yawRate
 
+        // Corridor (Mode F: Best Adaptive Hybrid). Same layered-gating shape as
+        // Stage 12: the channel itself runs and tracks whenever a road is locked
+        // on, but its road-snapped position only reaches the outer UKF during a
+        // blackout, using the exact same speed/yaw evidence Channel A is already
+        // getting this cycle - not a second, independent measurement. The
+        // variance passed to the corridor filter's own update_speed mirrors
+        // finalRChannelA's source but is never squared again the way
+        // finalRChannelA is by the outer UKF's rChannelAOverride path (see
+        // Stage12Output.rChannelA's doc): Channel P has no learned variance, so
+        // its configured 1-sigma is squared here into a pseudo-variance instead.
+        val corridorSpeedVariance = when {
+            stage12Output != null -> stage12Output.rChannelA
+            channelSpeed != null -> config.physics.rMps * config.physics.rMps
+            else -> null
+        }
+        val priorState = filter.state()
+        val corridorOutput = if (blackout && finalChannelASpeed != null && corridorSpeedVariance != null) {
+            corridorChannel?.update(
+                dt = dt,
+                speedMeas = finalChannelASpeed,
+                speedUncertainty = corridorSpeedVariance,
+                yawRateRadS = finalGyroYaw,
+                outerPositionNorthEast = doubleArrayOf(priorState.posN, priorState.posE)
+            )
+        } else {
+            null
+        }
+
         val state = filter.step(
             dt = dt,
             gyroYaw = finalGyroYaw,
@@ -505,7 +590,9 @@ class FusionPipeline(
             rChannelAOverride = finalRChannelA,
             zupt = zuptActive,
             rZupt = config.zupt.rMps,
-            gnssHeading = gnssHeading
+            gnssHeading = gnssHeading,
+            roadSignaturePos = corridorOutput?.positionNorthEast,
+            roadSignatureConfidence = corridorOutput?.confidence ?: 0.0
         )
 
         // Coast baseline: same gyro, no GNSS, no velocity channel, and no Stage 12
@@ -519,6 +606,11 @@ class FusionPipeline(
             tNs, state, coastState, channelSpeed,
             stage12SpeedMps = stage12Output?.calibratedSpeedMps,
             stage12Active = stage12Output != null,
+            corridorRoadLocked = corridorChannel?.roadLocked == true,
+            corridorConfidence = corridorOutput?.confidence ?: 0.0,
+            corridorActive = corridorOutput != null &&
+                corridorOutput.confidence >= config.fusion.roadSignatureConfidenceThreshold,
+            corridorPositionCorrectionM = corridorOutput?.correctionMagnitudeM,
             zuptActive
         )
         lastSnapshot = snapshot
@@ -532,6 +624,10 @@ class FusionPipeline(
         channelSpeed: Double?,
         stage12SpeedMps: Double?,
         stage12Active: Boolean,
+        corridorRoadLocked: Boolean,
+        corridorConfidence: Double,
+        corridorActive: Boolean,
+        corridorPositionCorrectionM: Double?,
         zuptActive: Boolean
     ): FusionSnapshot {
         val startNs = sessionStartNs ?: tNs
@@ -585,6 +681,10 @@ class FusionPipeline(
             channelPSpeed = channelSpeed,
             stage12SpeedMps = stage12SpeedMps,
             stage12Active = stage12Active,
+            corridorRoadLocked = corridorRoadLocked,
+            corridorConfidence = corridorConfidence,
+            corridorActive = corridorActive,
+            corridorPositionCorrectionM = corridorPositionCorrectionM,
             zuptActive = zuptActive,
             imuRateHz = imuRateHz,
             stepLatencyMs = lastLatencyMs,

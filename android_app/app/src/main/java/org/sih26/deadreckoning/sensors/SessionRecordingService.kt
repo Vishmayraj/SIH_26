@@ -534,7 +534,15 @@ class SessionRecordingService : Service() {
         // a missing/corrupt model degrades to stage12Model = null (Channel P only)
         // rather than failing the whole recording start. See MotionSpeedNetOnnx's
         // class doc.
-        pipeline = FusionPipeline(stage12Model = MotionSpeedNetOnnx.loadFromAssets(this))
+        //
+        // Corridor: OverpassRoadNetworkProvider fetches once, lazily, on the
+        // session's first GNSS fix (see CorridorChannel.onFirstFix) - constructing
+        // it here just wires the (network-free at construction time) client in, it
+        // does not touch the network yet.
+        pipeline = FusionPipeline(
+            stage12Model = MotionSpeedNetOnnx.loadFromAssets(this),
+            roadNetworkProvider = OverpassRoadNetworkProvider()
+        )
 
         val (newSessionId, outFile) = sessionStore.newSessionFile()
         sessionId = newSessionId

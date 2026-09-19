@@ -12,6 +12,7 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -24,6 +25,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -345,6 +347,8 @@ private fun LiveScreen(
             }
         }
 
+        t?.snapshot?.let { snap -> VelocityChannelCard(snap, t.blackout) }
+
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column {
                 Text("Software GNSS blackout", style = MaterialTheme.typography.bodyLarge)
@@ -352,6 +356,68 @@ private fun LiveScreen(
             }
             Switch(checked = t?.blackout == true, onCheckedChange = blackout)
         }
+    }
+}
+
+/**
+ * Which velocity channel is actually feeding the UKF's Channel A slot right now,
+ * and what the road-matching corridor filter (if a road was locked on) thinks the
+ * position correction looks like. This is the one thing a judge watching a live
+ * blackout demo needs on screen without digging into Diagnostics: Channel P alone
+ * used to be silently invisible outside that tab (see FusionSnapshot.channelPSpeed's
+ * doc, pre-Stage-12), and Stage 12 / corridor status had no UI surface at all until
+ * this card - both were already flowing through FusionSnapshot, just unread.
+ *
+ * Only shown while a session is running (the caller gates on t?.snapshot being
+ * non-null), so there is nothing to render before the filter initialises.
+ */
+@Composable
+private fun VelocityChannelCard(snap: org.sih26.deadreckoning.fusion.FusionSnapshot, blackout: Boolean) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Velocity channels", style = MaterialTheme.typography.titleSmall)
+            ChannelStatusRow(
+                name = "Channel P (physics)",
+                valueText = snap.channelPSpeed?.let { "${fmt(it)} m/s" } ?: "not resolved",
+                active = blackout && !snap.stage12Active && !snap.corridorActive && snap.channelPSpeed != null
+            )
+            ChannelStatusRow(
+                name = "Stage 12 (MotionSpeedNet)",
+                valueText = snap.stage12SpeedMps?.let { "${fmt(it)} m/s" } ?: "warming up / not calibrated",
+                active = snap.stage12Active
+            )
+            ChannelStatusRow(
+                name = "Corridor (road-matched)",
+                valueText = if (snap.corridorRoadLocked) {
+                    "conf ${fmt(snap.corridorConfidence * 100)}%" + (snap.corridorPositionCorrectionM?.let { " - ${fmt(it)} m correction" } ?: "")
+                } else {
+                    "no road locked"
+                },
+                active = snap.corridorActive
+            )
+            if (!blackout) {
+                Text(
+                    "GNSS is live - these are shown for visibility only; none of them feed the filter.",
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChannelStatusRow(name: String, valueText: String, active: Boolean) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Box(
+                Modifier.size(8.dp).background(
+                    color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                    shape = androidx.compose.foundation.shape.CircleShape
+                )
+            )
+            Text(name, style = MaterialTheme.typography.bodyMedium, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal)
+        }
+        Text(valueText, style = MaterialTheme.typography.bodyMedium, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal)
     }
 }
 
@@ -534,6 +600,11 @@ private fun DiagnosticsScreen(t: SessionRecordingService.RecordingTelemetry?, fr
                     DiagRow("Filter step latency", "${fmt(snap.stepLatencyMs)} ms")
                     DiagRow("ZUPT active this cycle", if (snap.zuptActive) "yes" else "no")
                     DiagRow("Channel P speed", snap.channelPSpeed?.let { "${fmt(it)} m/s" } ?: "not resolved")
+                    DiagRow("Stage 12 speed", snap.stage12SpeedMps?.let { "${fmt(it)} m/s" } ?: "not resolved")
+                    DiagRow("Stage 12 feeding UKF this cycle", if (snap.stage12Active) "yes" else "no")
+                    DiagRow("Corridor road locked", if (snap.corridorRoadLocked) "yes" else "no")
+                    DiagRow("Corridor progress confidence", "${fmt(snap.corridorConfidence * 100)}%")
+                    DiagRow("Corridor feeding UKF this cycle", if (snap.corridorActive) "yes" else "no")
                     DiagRow("Fused position (N,E)", "${fmt(snap.fusedNorth)}, ${fmt(snap.fusedEast)} m")
                     DiagRow("Coast position (N,E)", "${fmt(snap.coastNorth)}, ${fmt(snap.coastEast)} m")
                     DiagRow("Truth position (N,E)", "${fmt(snap.lastTruthNorth)}, ${fmt(snap.lastTruthEast)} m")

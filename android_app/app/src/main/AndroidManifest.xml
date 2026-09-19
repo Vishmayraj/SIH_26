@@ -6,6 +6,17 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
+    <!-- Corridor road-matching (fusion/CorridorFilter.kt) fetches the drivable OSM
+         road network for the session's driving area from the public Overpass API
+         (sensors/OverpassRoadNetworkProvider.kt) once per session, opportunistically,
+         as soon as the first GNSS fix is available. Nothing else in this app touches
+         the network - raw sensor/GNSS logging and the Stage 12 ONNX model (bundled
+         as an asset) are both fully offline. A phone with no data connection simply
+         never gets a road lock; corridor matching degrades to "not available this
+         session" exactly like a missing/corrupt Stage 12 model does, never a crash. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <!-- Foreground service so sensor delivery survives the screen turning off
          during a test drive. Android 14 (API 34) requires a declared type; this one
          is a location-tracking service by nature even though it also reads raw IMU,
