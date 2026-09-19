@@ -20,13 +20,15 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.List
-import androidx.compose.material.icons.filled.Navigation
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Navigation
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -43,6 +45,7 @@ import org.sih26.deadreckoning.ui.TrackPoint
 import org.sih26.deadreckoning.ui.TrajectoryCanvas
 import java.io.File
 import java.util.Locale
+import kotlinx.coroutines.launch
 
 /**
  * Three destinations, matching how a field test actually happens: watch the live
@@ -50,8 +53,15 @@ import java.util.Locale
  * diagnostics only when something looks wrong. Keeping diagnostics off the main
  * screen was an explicit call: the person operating the phone during a demo needs
  * four or five numbers, not a debug console.
+ *
+ * Reached from the navigation drawer, which every destination opens from the same
+ * top-bar menu button. [title] is what the top bar shows; [label] is the drawer entry.
  */
-private enum class Tab(val label: String) { LIVE("Live"), SESSIONS("Sessions"), DIAGNOSTICS("Diagnostics") }
+private enum class Tab(val label: String, val title: String, val icon: ImageVector) {
+    LIVE("Live", "SIH26 Field Test", Icons.Default.Navigation),
+    SESSIONS("Sessions", "Recorded sessions", Icons.Default.List),
+    DIAGNOSTICS("Diagnostics", "Diagnostics", Icons.Default.Info)
+}
 
 class MainActivity : ComponentActivity() {
     // Read reactively from Compose so the UI updates the moment permission state
@@ -153,6 +163,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun App(
     hasLocationPermission: Boolean,
@@ -208,30 +219,65 @@ private fun App(
         }
     }
 
-    Scaffold(bottomBar = {
-        NavigationBar {
-            NavigationBarItem(tab == Tab.LIVE, { tab = Tab.LIVE }, { Icon(Icons.Default.Navigation, null) }, label = { Text(Tab.LIVE.label) })
-            NavigationBarItem(tab == Tab.SESSIONS, { tab = Tab.SESSIONS; records = listSessions() }, { Icon(Icons.Default.List, null) }, label = { Text(Tab.SESSIONS.label) })
-            NavigationBarItem(tab == Tab.DIAGNOSTICS, { tab = Tab.DIAGNOSTICS }, { Icon(Icons.Default.Info, null) }, label = { Text(Tab.DIAGNOSTICS.label) })
-        }
-    }) { padding ->
-        Box(Modifier.padding(padding)) {
-            when (tab) {
-                Tab.LIVE -> LiveScreen(
-                    t = telemetry, trail = trail, road = road,
-                    hasLocationPermission = hasLocationPermission,
-                    requestPermission = requestPermission,
-                    openAppSettings = openAppSettings,
-                    freeStorageBytes = freeStorageBytes,
-                    ignoringBatteryOptimizations = ignoringBatteryOptimizations,
-                    requestIgnoreBatteryOptimizations = requestIgnoreBatteryOptimizations,
-                    start = { trail.clear(); road = null; start() }, stop = stop, blackout = blackout
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    fun navigate(target: Tab) {
+        tab = target
+        if (target == Tab.SESSIONS) records = listSessions()
+        scope.launch { drawerState.close() }
+    }
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                Text(
+                    "SIH26 Dead Reckoning",
+                    Modifier.padding(horizontal = 28.dp, vertical = 20.dp),
+                    style = MaterialTheme.typography.titleMedium
                 )
-                Tab.SESSIONS -> SessionsScreen(records, export) { record ->
-                    deleteSession(record)
-                    records = listSessions()
+                HorizontalDivider()
+                Spacer(Modifier.height(8.dp))
+                Tab.values().forEach { entry ->
+                    NavigationDrawerItem(
+                        label = { Text(entry.label) },
+                        icon = { Icon(entry.icon, contentDescription = null) },
+                        selected = tab == entry,
+                        onClick = { navigate(entry) },
+                        modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding)
+                    )
                 }
-                Tab.DIAGNOSTICS -> DiagnosticsScreen(telemetry, frontEndStatus)
+            }
+        }
+    ) {
+        Scaffold(topBar = {
+            TopAppBar(
+                title = { Text(tab.title) },
+                navigationIcon = {
+                    IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                        Icon(Icons.Default.Menu, contentDescription = "Open navigation")
+                    }
+                }
+            )
+        }) { padding ->
+            Box(Modifier.padding(padding)) {
+                when (tab) {
+                    Tab.LIVE -> LiveScreen(
+                        t = telemetry, trail = trail, road = road,
+                        hasLocationPermission = hasLocationPermission,
+                        requestPermission = requestPermission,
+                        openAppSettings = openAppSettings,
+                        freeStorageBytes = freeStorageBytes,
+                        ignoringBatteryOptimizations = ignoringBatteryOptimizations,
+                        requestIgnoreBatteryOptimizations = requestIgnoreBatteryOptimizations,
+                        start = { trail.clear(); road = null; start() }, stop = stop, blackout = blackout
+                    )
+                    Tab.SESSIONS -> SessionsScreen(records, export) { record ->
+                        deleteSession(record)
+                        records = listSessions()
+                    }
+                    Tab.DIAGNOSTICS -> DiagnosticsScreen(telemetry, frontEndStatus)
+                }
             }
         }
     }
@@ -269,8 +315,6 @@ private fun LiveScreen(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("SIH26 Field Test", style = MaterialTheme.typography.headlineSmall)
-
         if (!hasLocationPermission) {
             PermissionGate(requestPermission, openAppSettings)
             return@Column
@@ -588,7 +632,6 @@ private fun MetricRow(label1: String, value1: String, label2: String, value2: St
 @Composable
 private fun SessionsScreen(records: List<SessionRecord>, export: (File) -> Unit, delete: (SessionRecord) -> Unit) {
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("Recorded sessions", style = MaterialTheme.typography.headlineSmall)
         if (records.isEmpty()) {
             Text("No completed sessions yet. Recordings appear here after you stop them.")
             return@Column
@@ -654,7 +697,6 @@ private fun DiagnosticsScreen(t: SessionRecordingService.RecordingTelemetry?, fr
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Text("Diagnostics", style = MaterialTheme.typography.headlineSmall)
         Text(
             "Raw pipeline internals. Nothing here is smoothed for presentation; it is " +
                 "exactly what the fusion front end reports.",
