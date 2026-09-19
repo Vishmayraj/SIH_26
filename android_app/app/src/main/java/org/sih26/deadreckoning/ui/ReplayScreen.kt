@@ -1,6 +1,7 @@
 package org.sih26.deadreckoning.ui
 
 import android.net.Uri
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -10,6 +11,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -40,6 +42,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.Dp
@@ -54,6 +58,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.sih26.deadreckoning.R
 import org.sih26.deadreckoning.fusion.Stage12SpeedModel
+import org.sih26.deadreckoning.replay.BlackoutWindow
 import org.sih26.deadreckoning.replay.ReplayLoader
 import org.sih26.deadreckoning.replay.ReplayPoint
 import org.sih26.deadreckoning.replay.ReplaySession
@@ -140,11 +145,18 @@ fun ReplayScreen(
         }
         Text(
             "IO-VNBD replay needs the smartphone (S-) file: it plays the GPS track from the " +
-                "GPS latitude/longitude columns.",
+                "GPS latitude/longitude columns and, from the file's accelerometer and gyroscope " +
+                "columns, adds a Stage 12 track with simulated GNSS blackouts.",
             style = MaterialTheme.typography.bodySmall
         )
 
-        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (loading) {
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+            Text(
+                "Importing. An IO-VNBD file also runs the Stage 12 model over the drive, which can take a while.",
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
         error?.let {
             Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
                 Text(it, Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onErrorContainer)
@@ -215,6 +227,7 @@ private fun ReplayPlayer(session: ReplaySession, onClose: () -> Unit) {
     val visible = allPoints.subList(0, session.timelineCountUpTo(t))
 
     val truthNow = session.truthAt(t)
+    val outageNow = session.blackoutAt(t)
     val fusedNow = session.fusedAt(t)
     val coastNow = session.coastAt(t)
     // The last fix is at most ~1 s old, so this is a live indication, not a metric: the
@@ -244,6 +257,25 @@ private fun ReplayPlayer(session: ReplaySession, onClose: () -> Unit) {
             }
         }
 
+        if (outageNow != null) {
+            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        "SIMULATED GNSS BLACKOUT #${session.blackouts.indexOf(outageNow) + 1} - " +
+                            "${(t - outageNow.startS).toInt()} s of ${outageNow.durationS.toInt()} s",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                    Text(
+                        "Stage 12 is dead-reckoning on its own speed and yaw. The green GNSS track is " +
+                            "real and is only used to measure how far the red track drifts.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                }
+            }
+        }
+
         TrajectoryCanvas(
             points = visible,
             modifier = Modifier.fillMaxWidth(),
@@ -261,6 +293,13 @@ private fun ReplayPlayer(session: ReplaySession, onClose: () -> Unit) {
                         onValueChange = { t = it.toDouble() },
                         valueRange = session.startS.toFloat()..session.endS.toFloat()
                     )
+                    if (session.hasSimulatedBlackouts) {
+                        BlackoutBar(session, t)
+                        Text(
+                            "Shaded on the timeline: simulated GNSS blackouts.",
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     IconButton(onClick = { playing = !playing }) {
@@ -315,14 +354,43 @@ private fun ReplayPlayer(session: ReplaySession, onClose: () -> Unit) {
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
+                if (session.hasSimulatedBlackouts) {
+                    ReadoutRow(
+                        "Stage 12 vs real GNSS", session.stage12GapAt(t)?.let { "${fmt(it)} m" } ?: "--",
+                        "Stage 12 input", if (outageNow != null) "model only" else "GNSS-fed"
+                    )
+                }
                 if (session.hasStage12) {
                     Text(
-                        "Red track: Stage 12's own dead-reckoned trajectory, built on import from this " +
-                            "file's raw IMU - independent of GNSS the whole drive, not only during a blackout.",
+                        if (session.hasSimulatedBlackouts) {
+                            "Red track: Stage 12, built on import from this file's own accelerometer and " +
+                                "gyroscope. It follows GNSS (so it sits under the green track) until a " +
+                                "simulated blackout, then runs on the model's speed and yaw alone until GNSS " +
+                                "returns, when it snaps back to the fix."
+                        } else {
+                            "Red track: Stage 12's own dead-reckoned trajectory, built on import from this " +
+                                "file's raw IMU - independent of GNSS the whole drive, not only during a blackout."
+                        },
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                } else if (session.source == ReplaySource.IOVNBD_CSV) {
+                    Text(
+                        "No Stage 12 track: the model was unavailable, the file has no accelerometer/gyroscope " +
+                            "columns, or it is too short for a blackout.",
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
             }
+        }
+
+        if (session.hasSimulatedBlackouts) {
+            BlackoutSummary(
+                session.blackouts,
+                onSeek = { b ->
+                    t = (b.startS - 5.0).coerceAtLeast(session.startS)
+                    playing = true
+                }
+            )
         }
     }
 }
@@ -337,12 +405,78 @@ private fun ReplayPoint.toTrackPoint() = TrackPoint(
     }
 )
 
+/** The timeline as one strip: shaded where a simulated blackout happens, a thin line at
+ * the playhead. Sits directly under the slider, so it is inset by roughly the thumb radius
+ * to line up with the slider's track. */
+@Composable
+private fun BlackoutBar(session: ReplaySession, t: Double) {
+    val span = (session.endS - session.startS).coerceAtLeast(1e-6)
+    val base = MaterialTheme.colorScheme.surfaceVariant
+    val shade = MaterialTheme.colorScheme.error.copy(alpha = 0.55f)
+    val playhead = MaterialTheme.colorScheme.primary
+    Canvas(Modifier.fillMaxWidth().height(10.dp).padding(horizontal = 10.dp)) {
+        drawRect(base)
+        for (b in session.blackouts) {
+            val x0 = ((b.startS - session.startS) / span * size.width).toFloat()
+            val x1 = ((b.endS - session.startS) / span * size.width).toFloat()
+            drawRect(shade, topLeft = Offset(x0, 0f), size = Size((x1 - x0).coerceAtLeast(1f), size.height))
+        }
+        val px = ((t - session.startS) / span * size.width).toFloat()
+        drawRect(playhead, topLeft = Offset(px - 1f, 0f), size = Size(2f, size.height))
+    }
+}
+
+/** Per-outage result, worked out on import. Tapping one jumps the playhead to 5 s before
+ * it starts, so the red track can be watched leaving and rejoining the green one. */
+@Composable
+private fun BlackoutSummary(blackouts: List<BlackoutWindow>, onSeek: (BlackoutWindow) -> Unit) {
+    val errors = blackouts.mapNotNull { it.endErrorM }
+    val drifts = blackouts.mapNotNull { it.driftPercent }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Simulated blackouts (${blackouts.size})", style = MaterialTheme.typography.titleSmall)
+            if (errors.isNotEmpty()) {
+                Text(
+                    "Mean end error ${fmt(errors.average())} m" +
+                        (if (drifts.isNotEmpty()) ", mean drift ${fmt(drifts.average())}%" else "") +
+                        " - measured against the real GNSS, which the model never saw during these.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            blackouts.forEachIndexed { i, b ->
+                Column(Modifier.fillMaxWidth().clickable { onSeek(b) }, verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                    Text(
+                        "#${i + 1}  ${clock(b.startS)} - ${clock(b.endS)}  (${b.durationS.toInt()} s)",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text(
+                        if (b.endErrorM == null) {
+                            "no dead-reckoned points"
+                        } else {
+                            "End error ${fmt(b.endErrorM)} m, worst ${fmt(b.maxErrorM ?: b.endErrorM)} m" +
+                                (b.driftPercent?.let { ", drift ${fmt(it)}%" } ?: ", drift n/a (barely moved)") +
+                                (b.gnssDistanceM?.let { " over ${fmt(it)} m" } ?: "")
+                        },
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+            Text("Tap one to jump to it.", style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
 @Composable
 private fun ReadoutRow(label1: String, value1: String, label2: String, value2: String) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Column(Modifier.weight(1f)) { Text(label1, style = MaterialTheme.typography.labelSmall); Text(value1, style = MaterialTheme.typography.bodyLarge) }
         Column(Modifier.weight(1f)) { Text(label2, style = MaterialTheme.typography.labelSmall); Text(value2, style = MaterialTheme.typography.bodyLarge) }
     }
+}
+
+private fun clock(seconds: Double): String {
+    val s = seconds.coerceAtLeast(0.0).toInt()
+    return "%02d:%02d".format(Locale.ROOT, s / 60, s % 60)
 }
 
 private fun fmt(value: Double) = String.format(Locale.ROOT, "%.2f", value)

@@ -160,7 +160,7 @@ private fun Legend(truth: Color?, fused: Color?, coast: Color?, corridor: Color?
         if (fused != null) LegendRow(fused, "Fused (UKF)")
         if (coast != null) LegendRow(coast, "Coast baseline (no correction)")
         if (corridor != null) LegendRow(corridor, "Corridor (road-snapped)")
-        if (stage12 != null) LegendRow(stage12, "Stage 12 model (IMU-only, this import)")
+        if (stage12 != null) LegendRow(stage12, "Stage 12 model (this import)")
         if (road != null) LegendRow(road, "Locked OSM road")
     }
 }
