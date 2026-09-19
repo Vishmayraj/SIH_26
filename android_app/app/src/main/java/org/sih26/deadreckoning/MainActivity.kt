@@ -39,8 +39,10 @@ import org.sih26.deadreckoning.fusion.FusionSnapshot
 import org.sih26.deadreckoning.fusion.PipelinePhase
 import org.sih26.deadreckoning.fusion.RoadNetworkState
 import org.sih26.deadreckoning.fusion.RoadNetworkStatus
+import org.sih26.deadreckoning.fusion.Stage12SpeedModel
 import org.sih26.deadreckoning.replay.ReplayLoader
 import org.sih26.deadreckoning.replay.ReplaySession
+import org.sih26.deadreckoning.sensors.MotionSpeedNetOnnx
 import org.sih26.deadreckoning.sensors.SessionRecordingService
 import org.sih26.deadreckoning.sessions.SessionRecord
 import org.sih26.deadreckoning.sessions.SessionStore
@@ -97,6 +99,12 @@ class MainActivity : ComponentActivity() {
         pickedReplayUri = uri
     }
 
+    // Loaded once, lazily, from the same asset SessionRecordingService's live
+    // pipeline uses (see MotionSpeedNetOnnx's doc) - null (asset missing/corrupt)
+    // degrades a replay import to no Stage 12 track, same as it degrades the live
+    // filter to Channel P only.
+    private val stage12Model by lazy { MotionSpeedNetOnnx.loadFromAssets(this) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         hasLocationPermission = hasLocationPermission()
@@ -127,7 +135,8 @@ class MainActivity : ComponentActivity() {
                         pickReplayFile = { replayPicker.launch(arrayOf("*/*")) },
                         pickedReplayUri = pickedReplayUri,
                         consumePickedReplayUri = { pickedReplayUri = null },
-                        loadReplayFromUri = ::loadReplay
+                        loadReplayFromUri = ::loadReplay,
+                        stage12Model = stage12Model
                     )
                 }
             }
@@ -170,7 +179,7 @@ class MainActivity : ComponentActivity() {
     /** Runs on a background thread (see ReplayScreen), so blocking I/O is fine here. */
     private fun loadReplay(uri: Uri): ReplaySession {
         val stream = contentResolver.openInputStream(uri) ?: throw IOException("Could not open the selected file.")
-        return stream.use { ReplayLoader.load(it, displayName(uri)) }
+        return stream.use { ReplayLoader.load(it, displayName(uri), stage12Model) }
     }
 
     private fun displayName(uri: Uri): String =
@@ -213,7 +222,8 @@ private fun App(
     pickReplayFile: () -> Unit,
     pickedReplayUri: Uri?,
     consumePickedReplayUri: () -> Unit,
-    loadReplayFromUri: (Uri) -> ReplaySession
+    loadReplayFromUri: (Uri) -> ReplaySession,
+    stage12Model: Stage12SpeedModel? = null
 ) {
     var tab by remember { mutableStateOf(Tab.LIVE) }
     // Held here rather than inside the Replay screen so a loaded drive is still there
@@ -322,7 +332,8 @@ private fun App(
                         pickFile = pickReplayFile,
                         pickedUri = pickedReplayUri,
                         consumePickedUri = consumePickedReplayUri,
-                        loadFromUri = loadReplayFromUri
+                        loadFromUri = loadReplayFromUri,
+                        stage12Model = stage12Model
                     )
                     Tab.DIAGNOSTICS -> DiagnosticsScreen(telemetry, frontEndStatus)
                 }
@@ -440,7 +451,10 @@ private fun LiveScreen(
             ErrorBanner("The on-device fused track has stopped updating after an internal error. Raw sensor/GNSS logging is unaffected and this drive is still worth keeping.")
         }
 
-        TrajectoryCanvas(trail, Modifier.fillMaxWidth(), road)
+        TrajectoryCanvas(
+            trail, Modifier.fillMaxWidth(), road,
+            originLatDeg = t?.originLatDeg, originLonDeg = t?.originLonDeg
+        )
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {

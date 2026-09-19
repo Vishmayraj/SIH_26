@@ -3,7 +3,16 @@ package org.sih26.deadreckoning.replay
 import java.io.BufferedReader
 import java.io.InputStream
 import java.io.InputStreamReader
+import kotlin.math.cos
+import kotlin.math.sin
 import org.sih26.deadreckoning.fusion.LocalFrame
+import org.sih26.deadreckoning.fusion.MountLeveling
+import org.sih26.deadreckoning.fusion.Stage12Calibration
+import org.sih26.deadreckoning.fusion.Stage12Config
+import org.sih26.deadreckoning.fusion.Stage12Decimator
+import org.sih26.deadreckoning.fusion.Stage12FeatureExtractor
+import org.sih26.deadreckoning.fusion.Stage12SpeedModel
+import org.sih26.deadreckoning.fusion.Stage12Window
 
 /**
  * Reads the two things the Replay page can play:
@@ -14,12 +23,11 @@ import org.sih26.deadreckoning.fusion.LocalFrame
  *
  * The format is sniffed from the first line, so callers never have to say which.
  *
- * The JSONL parser only ever looks at `gnss`, `fused` and `coast` lines and skips the
- * 100 Hz `imu` lines by prefix without parsing them: a recording is dominated by IMU
- * lines, and nothing on this page uses them. Numbers are pulled out by key rather than
- * through a JSON library because the logger writes a fixed, flat schema and the
- * `fused`/`coast` streams are 100 Hz each - allocating a JSON object per line to read
- * two doubles would be most of the load time.
+ * The JSONL parser looks at `gnss`, `fused`, `coast` and (when [Stage12SpeedModel] is
+ * supplied) `imu` lines. Numbers are pulled out by key rather than through a JSON
+ * library because the logger writes a fixed, flat schema and several of these streams
+ * are 100 Hz each - allocating a JSON object per line to read a handful of doubles
+ * would be most of the load time.
  *
  * Failures throw [IllegalArgumentException] with a message meant to be shown to the
  * person as-is.
@@ -30,7 +38,13 @@ object ReplayLoader {
      * for more than this many points per second. */
     private const val MIN_TRACK_SPACING_S = 0.2
 
-    fun load(input: InputStream, label: String): ReplaySession {
+    /** [stage12Model] is optional and, when supplied, only used for a phone-session
+     * JSONL: it drives [buildStage12Trajectory] over that file's raw `imu` lines to
+     * add a second, GNSS-independent trajectory to the returned session. An IO-VNBD
+     * CSV carries no raw IMU stream, so the parameter has no effect there. Null (the
+     * default) skips this entirely and behaves exactly as before Stage 12 replay
+     * existed. */
+    fun load(input: InputStream, label: String, stage12Model: Stage12SpeedModel? = null): ReplaySession {
         val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8), 1 shl 16)
         reader.mark(1 shl 16)
         var first = reader.readLine()
@@ -39,7 +53,7 @@ object ReplayLoader {
         reader.reset()
 
         return if (first.trimStart('\uFEFF', ' ').startsWith("{")) {
-            parseJsonl(reader, label)
+            parseJsonl(reader, label, stage12Model)
         } else {
             parseIovnbdCsv(reader, label)
         }
@@ -50,6 +64,7 @@ object ReplayLoader {
     private const val GNSS_PREFIX = "{\"type\":\"gnss\""
     private const val FUSED_PREFIX = "{\"type\":\"fused\""
     private const val COAST_PREFIX = "{\"type\":\"coast\""
+    private const val IMU_PREFIX = "{\"type\":\"imu\""
     private const val T = "\"t\":"
     private const val PN = "\"pn\":"
     private const val PE = "\"pe\":"
@@ -58,12 +73,27 @@ object ReplayLoader {
     private const val SPEED = "\"speed\":"
     private const val BEARING = "\"bearing\":"
     private const val ACCURACY = "\"accuracy\":"
+    private const val AX = "\"ax\":"
+    private const val AY = "\"ay\":"
+    private const val AZ = "\"az\":"
+    private const val GX = "\"gx\":"
+    private const val GY = "\"gy\":"
+    private const val GZ = "\"gz\":"
 
-    private fun parseJsonl(reader: BufferedReader, label: String): ReplaySession {
+    private data class ImuSample(
+        val t: Double,
+        val ax: Double, val ay: Double, val az: Double,
+        val gx: Double, val gy: Double, val gz: Double
+    )
+
+    private fun parseJsonl(reader: BufferedReader, label: String, stage12Model: Stage12SpeedModel?): ReplaySession {
         var frame: LocalFrame? = null
         val truth = ArrayList<TruthFix>()
         val fused = ArrayList<ReplayPoint>()
         val coast = ArrayList<ReplayPoint>()
+        // Only collected when a model was actually supplied - a plain replay (no
+        // Stage 12 asset available) should not pay to buffer every 100 Hz line.
+        val imu = if (stage12Model != null) ArrayList<ImuSample>() else null
         var lastFusedT = Double.NEGATIVE_INFINITY
         var lastCoastT = Double.NEGATIVE_INFINITY
 
@@ -106,19 +136,123 @@ object ReplayLoader {
                     lastCoastT = t
                     coast.add(ReplayPoint(t, n, e, ReplayTrack.COAST))
                 }
-                // header, imu, anything unknown: not needed here.
+                imu != null && line.startsWith(IMU_PREFIX) -> {
+                    val t = number(line, T) ?: continue
+                    val ax = number(line, AX) ?: continue
+                    val ay = number(line, AY) ?: continue
+                    val az = number(line, AZ) ?: continue
+                    val gx = number(line, GX) ?: continue
+                    val gy = number(line, GY) ?: continue
+                    val gz = number(line, GZ) ?: continue
+                    imu.add(ImuSample(t, ax, ay, az, gx, gy, gz))
+                }
+                // header, or imu when no model was supplied: not needed here.
             }
         }
 
         require(truth.isNotEmpty()) { "No GNSS fixes in this session, so there is no track to replay." }
+
+        // Stage 12's own trajectory, independent of the fused/coast the recording
+        // pipeline already computed - see the function doc for what "independent"
+        // means here. Never allowed to fail the whole import: a model that cannot
+        // produce a usable track for this file still leaves truth/fused/coast intact.
+        val stage12 = if (imu != null && stage12Model != null) {
+            runCatching { buildStage12Trajectory(imu, truth, stage12Model) }.getOrElse { emptyList() }
+        } else {
+            emptyList()
+        }
 
         val starts = listOfNotNull(truth.first().t, fused.firstOrNull()?.t, coast.firstOrNull()?.t)
         val ends = listOfNotNull(truth.last().t, fused.lastOrNull()?.t, coast.lastOrNull()?.t)
         return ReplaySession(
             label = label, source = ReplaySource.PHONE_SESSION,
             startS = starts.min(), endS = ends.max(),
-            truth = truth, fused = fused, coast = coast
+            truth = truth, fused = fused, coast = coast, stage12 = stage12,
+            originLat0Deg = frame?.lat0Deg, originLon0Deg = frame?.lon0Deg
         )
+    }
+
+    /** Builds a second, GNSS-independent trajectory from this file's raw IMU stream:
+     * Stage 12's calibrated speed and corrected yaw rate, dead-reckoned forward from
+     * the session's first fix (its position and heading only - not its subsequent
+     * fixes), exactly the way [org.sih26.deadreckoning.fusion.Stage12Channel] and
+     * [org.sih26.deadreckoning.fusion.PhysicsSpeedChannel] integrate live.
+     *
+     * Unlike the live pipeline (which only lets Stage 12 drive position during a real
+     * blackout, gated by [org.sih26.deadreckoning.fusion.Stage12Channel.update]'s
+     * `blackout` parameter), this always uses Stage 12's prediction: the point of a
+     * replay import is to see what the model alone would have produced for the whole
+     * drive, not to reproduce the live blackout-gating decision.
+     *
+     * Calibration (raw model speed -> GNSS-scale speed) is fit once, across every
+     * (predicted, GNSS) pair the whole file offers, then frozen and applied
+     * throughout - a whole-file fit rather than the live pipeline's strictly
+     * pre-blackout-only one, since there is no blackout boundary in an import.
+     */
+    private fun buildStage12Trajectory(
+        imu: List<ImuSample>,
+        truth: List<TruthFix>,
+        model: Stage12SpeedModel
+    ): List<ReplayPoint> {
+        if (imu.size < 50) return emptyList()
+
+        // The app's own operating assumption ("Start parked so leveling can find
+        // gravity") holds for any session it recorded, so the first slice of imu
+        // doubles as the stationary window MountLeveling needs.
+        val levelWindowCount = minOf(300, imu.size / 4).coerceAtLeast(2)
+        val leveling = MountLeveling.fromStationaryWindow(
+            imu.take(levelWindowCount).map { doubleArrayOf(it.ax, it.ay, it.az) }
+        )
+
+        val extractor = Stage12FeatureExtractor(leveling)
+        val config = Stage12Config()
+        val decimator = Stage12Decimator(config)
+        val window = Stage12Window(config)
+        val calibration = Stage12Calibration(config)
+
+        data class Tick(val t: Double, val speedMps: Double, val yawRateRadS: Double)
+
+        val ticks = ArrayList<Tick>()
+        var truthIdx = 0
+
+        for (s in imu) {
+            val raw = extractor.extract(doubleArrayOf(s.ax, s.ay, s.az), doubleArrayOf(s.gx, s.gy, s.gz))
+            val tNs = (s.t * 1_000_000_000.0).toLong()
+            val decimated = decimator.add(tNs, raw) ?: continue
+            val normalized = extractor.normalize(decimated)
+            window.push(normalized)
+            val (accWindow, gyroWindow) = window.toModelInput() ?: continue
+            val prediction = model.predict(accWindow, gyroWindow) ?: continue
+
+            while (truthIdx + 1 < truth.size && truth[truthIdx + 1].t <= s.t) truthIdx++
+            val gnssSpeed = truth[truthIdx].speedMps
+            if (gnssSpeed != null) calibration.observe(prediction.speedMps, gnssSpeed)
+
+            val yawRate = leveling.yawRate(doubleArrayOf(s.gx, s.gy, s.gz)) + prediction.yawRateCorrectionRadS
+            ticks.add(Tick(s.t, prediction.speedMps, yawRate))
+        }
+        if (ticks.isEmpty()) return emptyList()
+        calibration.freeze()
+
+        var north = truth.first().north
+        var east = truth.first().east
+        var heading = Math.toRadians(truth.first().headingDeg ?: 0.0)
+        var lastT = ticks.first().t
+        val out = ArrayList<ReplayPoint>(ticks.size)
+        out.add(ReplayPoint(lastT, north, east, ReplayTrack.STAGE12))
+        for (i in 1 until ticks.size) {
+            val tick = ticks[i]
+            val dt = (tick.t - lastT).coerceIn(0.0, 1.0)
+            heading += tick.yawRateRadS * dt
+            val speed = calibration.apply(tick.speedMps)
+            // North/east convention matches fusion/Geo.kt: heading measured from
+            // north, vn = speed*cos(heading), ve = speed*sin(heading).
+            north += speed * cos(heading) * dt
+            east += speed * sin(heading) * dt
+            lastT = tick.t
+            out.add(ReplayPoint(lastT, north, east, ReplayTrack.STAGE12))
+        }
+        return out
     }
 
     /** Value after [marker] up to the next comma or closing brace, or null if the key is
@@ -224,7 +358,8 @@ object ReplayLoader {
         return ReplaySession(
             label = label, source = ReplaySource.IOVNBD_CSV,
             startS = 0.0, endS = maxOf(lastRowT, truth.last().t),
-            truth = truth, fused = emptyList(), coast = emptyList()
+            truth = truth, fused = emptyList(), coast = emptyList(),
+            originLat0Deg = frame?.lat0Deg, originLon0Deg = frame?.lon0Deg
         )
     }
 

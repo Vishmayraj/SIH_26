@@ -159,7 +159,12 @@ class SessionRecordingService : Service() {
         val gnssSatellitesInView: Int?,
         /** Of [gnssSatellitesInView], how many the chip is actually using toward a
          * fix this update. Null alongside [gnssSatellitesInView]. */
-        val gnssSatellitesUsed: Int?
+        val gnssSatellitesUsed: Int?,
+        /** [FusionPipeline.localFrame]'s origin fix, mirrored here so the Live
+         * screen's map (TrajectoryCanvas) can project North/East metres onto real
+         * lat/lon. Null until the pipeline has its first GNSS fix. */
+        val originLatDeg: Double?,
+        val originLonDeg: Double?
     )
 
     private lateinit var sensorManager: SensorManager
@@ -685,7 +690,9 @@ class SessionRecordingService : Service() {
                 locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
             }.getOrDefault(true),
             gnssSatellitesInView = gnssSatellitesInView,
-            gnssSatellitesUsed = gnssSatellitesUsed
+            gnssSatellitesUsed = gnssSatellitesUsed,
+            originLatDeg = pipeline?.localFrame?.lat0Deg,
+            originLonDeg = pipeline?.localFrame?.lon0Deg
         )
         Handler(Looper.getMainLooper()).post { telemetryListener?.invoke(telemetry) }
     }

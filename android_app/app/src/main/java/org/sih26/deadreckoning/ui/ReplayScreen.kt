@@ -53,6 +53,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.sih26.deadreckoning.R
+import org.sih26.deadreckoning.fusion.Stage12SpeedModel
 import org.sih26.deadreckoning.replay.ReplayLoader
 import org.sih26.deadreckoning.replay.ReplayPoint
 import org.sih26.deadreckoning.replay.ReplaySession
@@ -79,7 +80,12 @@ fun ReplayScreen(
     pickFile: () -> Unit,
     pickedUri: Uri?,
     consumePickedUri: () -> Unit,
-    loadFromUri: (Uri) -> ReplaySession
+    loadFromUri: (Uri) -> ReplaySession,
+    /** Injected the same way [org.sih26.deadreckoning.fusion.FusionPipeline] injects
+     * it live - null (e.g. the ONNX asset failed to load) just means an import never
+     * gets a Stage 12 track, same degrade-gracefully contract as everywhere else this
+     * interface is threaded through. */
+    stage12Model: Stage12SpeedModel? = null
 ) {
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -151,7 +157,11 @@ fun ReplayScreen(
         }
         records.forEach { r ->
             Card(Modifier.fillMaxWidth().clickable(enabled = !loading) {
-                load { FileInputStream(r.rawFile).use { ReplayLoader.load(it, "Drive ${r.startedUtc.take(16).replace('T', ' ')} UTC") } }
+                load {
+                    FileInputStream(r.rawFile).use {
+                        ReplayLoader.load(it, "Drive ${r.startedUtc.take(16).replace('T', ' ')} UTC", stage12Model)
+                    }
+                }
             }) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text("Drive - ${r.startedUtc.take(16).replace('T', ' ')} UTC", style = MaterialTheme.typography.titleSmall)
@@ -238,7 +248,9 @@ private fun ReplayPlayer(session: ReplaySession, onClose: () -> Unit) {
             points = visible,
             modifier = Modifier.fillMaxWidth(),
             extentPoints = allPoints,
-            emptyMessage = "Press play - the track builds up as the drive is replayed."
+            emptyMessage = "Press play - the track builds up as the drive is replayed.",
+            originLatDeg = session.originLat0Deg,
+            originLonDeg = session.originLon0Deg
         )
 
         Card(Modifier.fillMaxWidth()) {
@@ -303,6 +315,13 @@ private fun ReplayPlayer(session: ReplaySession, onClose: () -> Unit) {
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
+                if (session.hasStage12) {
+                    Text(
+                        "Red track: Stage 12's own dead-reckoned trajectory, built on import from this " +
+                            "file's raw IMU - independent of GNSS the whole drive, not only during a blackout.",
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
             }
         }
     }
@@ -314,6 +333,7 @@ private fun ReplayPoint.toTrackPoint() = TrackPoint(
         ReplayTrack.TRUTH -> TrackKind.TRUTH
         ReplayTrack.FUSED -> TrackKind.FUSED
         ReplayTrack.COAST -> TrackKind.COAST
+        ReplayTrack.STAGE12 -> TrackKind.STAGE12
     }
 )
 

@@ -68,6 +68,13 @@ dependencies {
     // android_app/app/src/main/assets/models/ and sensors/MotionSpeedNetOnnx.kt.
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.27.0")
 
+    // Real OpenStreetMap basemap for the Live and Replay trajectory views, replacing
+    // the blank north-up canvas TrajectoryCanvas used to draw on. osmdroid downloads
+    // (and disk-caches, under Configuration.osmdroidBasePath - see DeadReckoningApp)
+    // standard OSM raster tiles at render time rather than shipping a pre-baked tile
+    // set, so no fixed demo area has to be picked ahead of time.
+    implementation("org.osmdroid:osmdroid-android:6.1.20")
+
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }

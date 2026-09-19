@@ -11,7 +11,7 @@ package org.sih26.deadreckoning.replay
  */
 enum class ReplaySource { PHONE_SESSION, IOVNBD_CSV }
 
-enum class ReplayTrack { TRUTH, FUSED, COAST }
+enum class ReplayTrack { TRUTH, FUSED, COAST, STAGE12 }
 
 data class ReplayPoint(val t: Double, val north: Double, val east: Double, val track: ReplayTrack)
 
@@ -39,21 +39,35 @@ class ReplaySession(
     /** The recording app's own live fused / coast output, decimated. Empty for sources
      * that never ran the filter (IO-VNBD). */
     val fused: List<ReplayPoint>,
-    val coast: List<ReplayPoint>
+    val coast: List<ReplayPoint>,
+    /** A second trajectory built on import, not read from the log: the Stage 12
+     * model's own calibrated speed + corrected yaw rate, dead-reckoned from the raw
+     * IMU stream for the whole drive rather than only during a real blackout - see
+     * [ReplayLoader]'s buildStage12Trajectory. Empty when the source carries no raw
+     * IMU (IO-VNBD) or no Stage 12 model was available to the loader. */
+    val stage12: List<ReplayPoint> = emptyList(),
+    /** The session's [org.sih26.deadreckoning.fusion.LocalFrame] origin fix, so the
+     * Replay screen's map can project these North/East tracks onto real lat/lon.
+     * Null only if the file had no usable fix at all, which [ReplayLoader] already
+     * refuses to return a session for. */
+    val originLat0Deg: Double? = null,
+    val originLon0Deg: Double? = null
 ) {
-    /** All three tracks merged in time order, so "everything up to time t" is a prefix
+    /** All tracks merged in time order, so "everything up to time t" is a prefix
      * ([timelineCountUpTo]) instead of a per-frame filter. */
     val timeline: List<ReplayPoint> = (
-        truth.map { ReplayPoint(it.t, it.north, it.east, ReplayTrack.TRUTH) } + fused + coast
+        truth.map { ReplayPoint(it.t, it.north, it.east, ReplayTrack.TRUTH) } + fused + coast + stage12
         ).sortedBy { it.t }
 
     val hasFusion: Boolean get() = fused.isNotEmpty() || coast.isNotEmpty()
+    val hasStage12: Boolean get() = stage12.isNotEmpty()
 
     fun timelineCountUpTo(t: Double): Int = timeline.lastIndexAtOrBefore(t) { it.t } + 1
 
     fun truthAt(t: Double): TruthFix? = truth.getOrNull(truth.lastIndexAtOrBefore(t) { it.t })
     fun fusedAt(t: Double): ReplayPoint? = fused.getOrNull(fused.lastIndexAtOrBefore(t) { it.t })
     fun coastAt(t: Double): ReplayPoint? = coast.getOrNull(coast.lastIndexAtOrBefore(t) { it.t })
+    fun stage12At(t: Double): ReplayPoint? = stage12.getOrNull(stage12.lastIndexAtOrBefore(t) { it.t })
 }
 
 /** Index of the last element whose time is <= [t] in a time-sorted list, or -1. */
