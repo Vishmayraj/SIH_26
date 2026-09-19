@@ -38,12 +38,13 @@ object ReplayLoader {
      * for more than this many points per second. */
     private const val MIN_TRACK_SPACING_S = 0.2
 
-    /** [stage12Model] is optional and, when supplied, only used for a phone-session
-     * JSONL: it drives [buildStage12Trajectory] over that file's raw `imu` lines to
-     * add a second, GNSS-independent trajectory to the returned session. An IO-VNBD
-     * CSV carries no raw IMU stream, so the parameter has no effect there. Null (the
-     * default) skips this entirely and behaves exactly as before Stage 12 replay
-     * existed. */
+    /** [stage12Model] is optional. For a phone-session JSONL it drives
+     * [buildStage12Trajectory] over that file's raw `imu` lines to add a second,
+     * GNSS-independent trajectory to the returned session. For an IO-VNBD CSV it drives
+     * [IovnbdStage12.build] over the file's own 10 Hz accelerometer/gyroscope columns,
+     * producing a trajectory that follows GNSS except through simulated blackouts (see
+     * [ReplaySession.blackouts]). Null (the default) skips all of this and behaves
+     * exactly as before Stage 12 replay existed. */
     fun load(input: InputStream, label: String, stage12Model: Stage12SpeedModel? = null): ReplaySession {
         val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8), 1 shl 16)
         reader.mark(1 shl 16)
@@ -55,7 +56,7 @@ object ReplayLoader {
         return if (first.trimStart('\uFEFF', ' ').startsWith("{")) {
             parseJsonl(reader, label, stage12Model)
         } else {
-            parseIovnbdCsv(reader, label)
+            parseIovnbdCsv(reader, label, stage12Model)
         }
     }
 
@@ -281,7 +282,23 @@ object ReplayLoader {
     private val SATELLITES_COL = Regex("satellites\\s*in\\s*range")
     private val WHITESPACE = Regex("\\s+")
 
-    private fun parseIovnbdCsv(reader: BufferedReader, label: String): ReplaySession {
+    private val ACC_X_COL = Regex("accelerometer\\s*x")
+    private val ACC_Y_COL = Regex("accelerometer\\s*y")
+    private val ACC_Z_COL = Regex("accelerometer\\s*z")
+
+    /** Some IO-VNBD files name the gyro columns X/Y/Z and others Yaw/Pitch/Roll; either
+     * way MotionSpeedNet's gx/gy/gz are simply the three gyroscope columns in file order
+     * (`tools/baseline/data_loader.py`), so prefer explicit X/Y/Z names and otherwise
+     * take the first three columns that mention the gyroscope. */
+    private fun findGyroColumns(headers: List<String>): List<Int> {
+        val byAxis = listOf("x", "y", "z").map { axis ->
+            headers.indexOfFirst { Regex("gyroscope\\s*$axis\\b").containsMatchIn(it) }
+        }
+        if (byAxis.all { it >= 0 }) return byAxis
+        return headers.indices.filter { headers[it].contains("gyroscope") }.take(3)
+    }
+
+    private fun parseIovnbdCsv(reader: BufferedReader, label: String, stage12Model: Stage12SpeedModel?): ReplaySession {
         var headerLine = reader.readLine()
         while (headerLine != null && headerLine.isBlank()) headerLine = reader.readLine()
         require(headerLine != null) { "The file is empty." }
@@ -306,10 +323,19 @@ object ReplayLoader {
         val orientationIdx = find(ORIENTATION_COL)
         val satellitesIdx = find(SATELLITES_COL)
 
+        val accCols = listOf(find(ACC_X_COL), find(ACC_Y_COL), find(ACC_Z_COL))
+        val gyroCols = findGyroColumns(headers)
+        val hasImuColumns = accCols.all { it >= 0 } && gyroCols.size == 3
+        // Only buffered when a model was supplied, same reasoning as the JSONL path.
+        val imuRows = if (stage12Model != null && hasImuColumns) ArrayList<ImuRow>() else null
+
         val truth = ArrayList<TruthFix>()
         var frame: LocalFrame? = null
-        var firstT: Double? = null
+        var rawOriginS = 0.0
+        var prevRawS = Double.NaN
+        var clockOffsetS = 0.0
         var lastRowT = 0.0
+        var lastImuT = Double.NEGATIVE_INFINITY
         var lastLat = Double.NaN
         var lastLon = Double.NaN
 
@@ -321,13 +347,33 @@ object ReplayLoader {
                 if (i < 0) null else f.getOrNull(i)?.trim()?.toDoubleOrNull()?.takeIf { it.isFinite() }
 
             val tMs = cell(timeIdx) ?: continue
-            val tAbs = tMs / 1000.0
-            val t0 = firstT ?: tAbs.also { firstT = it }
-            val t = tAbs - t0
-            // Rows should be time-ordered; a row that runs backwards is dropped rather
-            // than allowed to scramble the timeline.
-            if (t < lastRowT) continue
+            val tRaw = tMs / 1000.0
+            if (prevRawS.isNaN()) {
+                rawOriginS = tRaw
+            } else if (tRaw < prevRawS) {
+                // The phone's logger clock restarted mid-file (S-S2 has one). Carry on from
+                // where the timeline had got to, one nominal 10 Hz row later, instead of
+                // discarding everything after the reset - the same repair
+                // tools/preprocessing/reconstruct_timestamps.py applies for training.
+                clockOffsetS = lastRowT + 0.1 - (tRaw - rawOriginS)
+            }
+            prevRawS = tRaw
+            val t = (tRaw - rawOriginS) + clockOffsetS
             lastRowT = t
+
+            if (imuRows != null && t > lastImuT) {
+                val ax = cell(accCols[0])
+                val ay = cell(accCols[1])
+                val az = cell(accCols[2])
+                val gx = cell(gyroCols[0])
+                val gy = cell(gyroCols[1])
+                val gz = cell(gyroCols[2])
+                if (ax != null && ay != null && az != null && gx != null && gy != null && gz != null) {
+                    // IO-VNBD logs GPS speed in km/h.
+                    imuRows.add(ImuRow(t, ax, ay, az, gx, gy, gz, cell(speedIdx)?.let { it / 3.6 }))
+                    lastImuT = t
+                }
+            }
 
             val lat = cell(latIdx) ?: continue
             val lon = cell(lonIdx) ?: continue
@@ -355,10 +401,21 @@ object ReplayLoader {
 
         require(truth.isNotEmpty()) { "No usable GPS fixes in this file (GPS Latitude / GPS Longitude were empty or zero)." }
 
+        // Stage 12's second trajectory, with simulated GNSS blackouts - the slow part of an
+        // import. Never allowed to fail it: a model that cannot produce a track for this
+        // file still leaves the GNSS replay intact.
+        val stage12 = if (imuRows != null && stage12Model != null) {
+            runCatching { IovnbdStage12.build(imuRows, truth, stage12Model) }.getOrNull()
+        } else {
+            null
+        }
+
         return ReplaySession(
             label = label, source = ReplaySource.IOVNBD_CSV,
             startS = 0.0, endS = maxOf(lastRowT, truth.last().t),
             truth = truth, fused = emptyList(), coast = emptyList(),
+            stage12 = stage12?.points ?: emptyList(),
+            blackouts = stage12?.blackouts ?: emptyList(),
             originLat0Deg = frame?.lat0Deg, originLon0Deg = frame?.lon0Deg
         )
     }

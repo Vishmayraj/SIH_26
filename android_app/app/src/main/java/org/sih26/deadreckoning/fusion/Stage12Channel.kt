@@ -66,6 +66,18 @@ object Stage12NormStats {
     // gyro slot order: [gx, gy, gz, gyro_mag]
     val gyroMean = doubleArrayOf(-7.208285002185238e-04, -6.184151242041602e-03, -2.8332014316257024e-05, 0.16268821950902476)
     val gyroStd = doubleArrayOf(0.10156945587052349, 0.2020954589455439, 0.11273504824688856, 0.19349155417395442)
+
+    /** Normalise a raw 8-vector `[ax, ay, az, accel_mag, gx, gy, gz, gyro_mag]` into the
+     * model's `[acc(4), gyro(4)]` layout. Lives here rather than only on
+     * [Stage12FeatureExtractor] so a caller that already has gravity-free features
+     * (the IO-VNBD replay import, which reproduces `tools/baseline/data_loader.py`'s
+     * own EMA gravity removal) can normalise without building a [MountLeveling]. */
+    fun normalize(raw: DoubleArray): FloatArray {
+        val out = FloatArray(8)
+        for (i in 0 until 4) out[i] = ((raw[i] - accMean[i]) / accStd[i]).toFloat()
+        for (i in 0 until 4) out[4 + i] = ((raw[4 + i] - gyroMean[i]) / gyroStd[i]).toFloat()
+        return out
+    }
 }
 
 data class Stage12Config(
@@ -152,16 +164,7 @@ class Stage12FeatureExtractor(private val leveling: MountLeveling) {
 
     /** Normalise a raw 8-vector from [extract] using [Stage12NormStats], splitting
      * it into the model's two 4-channel branches. */
-    fun normalize(raw: DoubleArray): FloatArray {
-        val out = FloatArray(8)
-        for (i in 0 until 4) {
-            out[i] = ((raw[i] - Stage12NormStats.accMean[i]) / Stage12NormStats.accStd[i]).toFloat()
-        }
-        for (i in 0 until 4) {
-            out[4 + i] = ((raw[4 + i] - Stage12NormStats.gyroMean[i]) / Stage12NormStats.gyroStd[i]).toFloat()
-        }
-        return out
-    }
+    fun normalize(raw: DoubleArray): FloatArray = Stage12NormStats.normalize(raw)
 }
 
 /** Block-averages 100 Hz feature ticks down to ~10 Hz. Time-based rather than a

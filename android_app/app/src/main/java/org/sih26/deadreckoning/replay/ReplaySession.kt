@@ -1,5 +1,7 @@
 package org.sih26.deadreckoning.replay
 
+import kotlin.math.hypot
+
 /**
  * What a replay plays back, independent of where it came from. Deliberately free of
  * Android and Compose imports, same reasoning as the fusion package: the parsing in
@@ -30,6 +32,35 @@ data class TruthFix(
     val withheld: Boolean
 )
 
+/**
+ * One simulated GNSS outage on an imported drive: between [startS] and [endS] the
+ * Stage 12 trajectory was denied every GNSS fix and had to dead-reckon on the model's
+ * own speed and yaw output. The real fixes are still in the file (and still plotted as
+ * truth), which is what makes the divergence measurable after the fact.
+ *
+ * The three metrics are worked out once, on import, against the real GNSS track
+ * (linearly interpolated between its ~1 Hz fixes); null when the outage produced no
+ * dead-reckoned point to measure.
+ */
+data class BlackoutWindow(
+    val startS: Double,
+    val endS: Double,
+    /** Distance between Stage 12 and real GNSS at the last point before GNSS returned. */
+    val endErrorM: Double?,
+    /** Worst distance between Stage 12 and real GNSS at any point of the outage. */
+    val maxErrorM: Double?,
+    /** How far the real GNSS track travelled during the outage - the denominator of drift. */
+    val gnssDistanceM: Double?
+) {
+    val durationS: Double get() = endS - startS
+
+    /** End error as a percentage of distance travelled, the SIH scorecard's own
+     * definition of drift. Null when the vehicle barely moved (a percentage of ~0 m is
+     * noise, not a metric). */
+    val driftPercent: Double?
+        get() = if (endErrorM != null && gnssDistanceM != null && gnssDistanceM > 5.0) endErrorM / gnssDistanceM * 100.0 else null
+}
+
 class ReplaySession(
     val label: String,
     val source: ReplaySource,
@@ -46,6 +77,12 @@ class ReplaySession(
      * [ReplayLoader]'s buildStage12Trajectory. Empty when the source carries no raw
      * IMU (IO-VNBD) or no Stage 12 model was available to the loader. */
     val stage12: List<ReplayPoint> = emptyList(),
+    /** The simulated GNSS outages [stage12] was run through, in time order. While none
+     * is active [stage12] is simply the GNSS track, so it sits on top of truth; inside
+     * one it is model-only dead reckoning and free to diverge. Empty whenever [stage12]
+     * is, and for a phone session (whose outages, if any, are the real ones flagged by
+     * [TruthFix.withheld]). */
+    val blackouts: List<BlackoutWindow> = emptyList(),
     /** The session's [org.sih26.deadreckoning.fusion.LocalFrame] origin fix, so the
      * Replay screen's map can project these North/East tracks onto real lat/lon.
      * Null only if the file had no usable fix at all, which [ReplayLoader] already
@@ -61,6 +98,22 @@ class ReplaySession(
 
     val hasFusion: Boolean get() = fused.isNotEmpty() || coast.isNotEmpty()
     val hasStage12: Boolean get() = stage12.isNotEmpty()
+    val hasSimulatedBlackouts: Boolean get() = blackouts.isNotEmpty()
+
+    /** The simulated outage that contains [t], if any. */
+    fun blackoutAt(t: Double): BlackoutWindow? = blackouts.firstOrNull { t >= it.startS && t < it.endS }
+
+    /** How far the Stage 12 track is from real GNSS at the moment of its latest point.
+     * Compared at the Stage 12 point's own time, against GNSS interpolated to that same
+     * instant, so that a stale ~1 Hz fix is not mistaken for divergence: while GNSS is
+     * feeding Stage 12 this reads ~0, and inside an outage it is the true drift. Null
+     * if there is no Stage 12 point yet or it is over a second old. */
+    fun stage12GapAt(t: Double): Double? {
+        val p = stage12At(t) ?: return null
+        if (t - p.t > 1.0) return null
+        val truthPos = interpolateTruth(truth, p.t) ?: return null
+        return hypot(p.north - truthPos[0], p.east - truthPos[1])
+    }
 
     fun timelineCountUpTo(t: Double): Int = timeline.lastIndexAtOrBefore(t) { it.t } + 1
 
@@ -68,6 +121,21 @@ class ReplaySession(
     fun fusedAt(t: Double): ReplayPoint? = fused.getOrNull(fused.lastIndexAtOrBefore(t) { it.t })
     fun coastAt(t: Double): ReplayPoint? = coast.getOrNull(coast.lastIndexAtOrBefore(t) { it.t })
     fun stage12At(t: Double): ReplayPoint? = stage12.getOrNull(stage12.lastIndexAtOrBefore(t) { it.t })
+}
+
+/** Real GNSS position at time [t], linearly interpolated between the two surrounding
+ * fixes (clamped to the first/last fix outside the track). [north, east] in metres, or
+ * null for an empty track. */
+internal fun interpolateTruth(truth: List<TruthFix>, t: Double): DoubleArray? {
+    if (truth.isEmpty()) return null
+    val i = truth.lastIndexAtOrBefore(t) { it.t }
+    if (i < 0) return doubleArrayOf(truth[0].north, truth[0].east)
+    if (i >= truth.size - 1) return doubleArrayOf(truth[i].north, truth[i].east)
+    val a = truth[i]
+    val b = truth[i + 1]
+    val span = b.t - a.t
+    val f = if (span <= 1e-6) 0.0 else ((t - a.t) / span).coerceIn(0.0, 1.0)
+    return doubleArrayOf(a.north + f * (b.north - a.north), a.east + f * (b.east - a.east))
 }
 
 /** Index of the last element whose time is <= [t] in a time-sorted list, or -1. */
