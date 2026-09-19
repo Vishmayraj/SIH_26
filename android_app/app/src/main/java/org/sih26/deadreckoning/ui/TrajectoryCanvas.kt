@@ -44,29 +44,41 @@ data class TrackPoint(val north: Double, val east: Double, val kind: TrackKind)
  * from FusionSnapshot.corridorRoad). It is drawn as an underlay only and never widens
  * the view: the extent comes from the tracks alone, so a chained road that runs for
  * kilometres cannot shrink the track to a dot. Segments outside the view are skipped.
+ *
+ * [extentPoints], when given, sets the view from that list instead of from [points]:
+ * a replay passes its whole session here so the view stays put while [points] grows,
+ * instead of re-zooming on every frame. The legend likewise lists only the tracks
+ * present in whichever list sets the view.
  */
 @Composable
-fun TrajectoryCanvas(points: List<TrackPoint>, modifier: Modifier = Modifier, road: List<DoubleArray>? = null) {
+fun TrajectoryCanvas(
+    points: List<TrackPoint>,
+    modifier: Modifier = Modifier,
+    road: List<DoubleArray>? = null,
+    extentPoints: List<TrackPoint>? = null,
+    emptyMessage: String = "Trajectory will appear once the fix is initialised."
+) {
+    val viewPoints = extentPoints ?: points
     val truthColor = Color(0xFF2E7D32)   // GNSS ground truth - green
     val fusedColor = Color(0xFF1565C0)   // UKF fused estimate - blue
     val coastColor = Color(0xFFE65100)   // no-correction coast baseline - orange
     val corridorColor = Color(0xFF8E24AA) // corridor road-snapped position - purple
     val roadColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
-    val hasCorridorTrack = points.any { it.kind == TrackKind.CORRIDOR }
+    val present = viewPoints.mapTo(HashSet()) { it.kind }
     val hasRoad = road != null && road.size >= 2
 
     Box(modifier.fillMaxWidth().height(220.dp).background(MaterialTheme.colorScheme.surfaceVariant)) {
         if (points.size < 2) {
             Text(
-                "Trajectory will appear once the fix is initialised.",
+                emptyMessage,
                 Modifier.align(Alignment.Center).padding(16.dp),
                 style = MaterialTheme.typography.bodySmall
             )
             return@Box
         }
         Canvas(Modifier.fillMaxWidth().height(220.dp).padding(8.dp)) {
-            val allNorth = points.map { it.north }
-            val allEast = points.map { it.east }
+            val allNorth = viewPoints.map { it.north }
+            val allEast = viewPoints.map { it.east }
             val minN = allNorth.min(); val maxN = allNorth.max()
             val minE = allEast.min(); val maxE = allEast.max()
             // Square, padded extent so the track never touches the edge and a
@@ -128,8 +140,10 @@ fun TrajectoryCanvas(points: List<TrackPoint>, modifier: Modifier = Modifier, ro
         }
         Box(Modifier.align(Alignment.TopStart).padding(8.dp)) {
             Legend(
-                truthColor, fusedColor, coastColor,
-                corridor = if (hasCorridorTrack) corridorColor else null,
+                truth = if (TrackKind.TRUTH in present) truthColor else null,
+                fused = if (TrackKind.FUSED in present) fusedColor else null,
+                coast = if (TrackKind.COAST in present) coastColor else null,
+                corridor = if (TrackKind.CORRIDOR in present) corridorColor else null,
                 road = if (hasRoad) roadColor else null
             )
         }
@@ -137,11 +151,11 @@ fun TrajectoryCanvas(points: List<TrackPoint>, modifier: Modifier = Modifier, ro
 }
 
 @Composable
-private fun Legend(truth: Color, fused: Color, coast: Color, corridor: Color?, road: Color?) {
+private fun Legend(truth: Color?, fused: Color?, coast: Color?, corridor: Color?, road: Color?) {
     Column {
-        LegendRow(truth, "GNSS truth (withheld during blackout, still plotted)")
-        LegendRow(fused, "Fused (UKF)")
-        LegendRow(coast, "Coast baseline (no correction)")
+        if (truth != null) LegendRow(truth, "GNSS truth (withheld during blackout, still plotted)")
+        if (fused != null) LegendRow(fused, "Fused (UKF)")
+        if (coast != null) LegendRow(coast, "Coast baseline (no correction)")
         if (corridor != null) LegendRow(corridor, "Corridor (road-snapped)")
         if (road != null) LegendRow(road, "Locked OSM road")
     }

@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -24,6 +25,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Navigation
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -37,20 +39,25 @@ import org.sih26.deadreckoning.fusion.FusionSnapshot
 import org.sih26.deadreckoning.fusion.PipelinePhase
 import org.sih26.deadreckoning.fusion.RoadNetworkState
 import org.sih26.deadreckoning.fusion.RoadNetworkStatus
+import org.sih26.deadreckoning.replay.ReplayLoader
+import org.sih26.deadreckoning.replay.ReplaySession
 import org.sih26.deadreckoning.sensors.SessionRecordingService
 import org.sih26.deadreckoning.sessions.SessionRecord
 import org.sih26.deadreckoning.sessions.SessionStore
+import org.sih26.deadreckoning.ui.ReplayScreen
 import org.sih26.deadreckoning.ui.TrackKind
 import org.sih26.deadreckoning.ui.TrackPoint
 import org.sih26.deadreckoning.ui.TrajectoryCanvas
 import java.io.File
+import java.io.IOException
 import java.util.Locale
 import kotlinx.coroutines.launch
 
 /**
- * Three destinations, matching how a field test actually happens: watch the live
- * pipeline while driving, review what got recorded afterwards, and dig into raw
- * diagnostics only when something looks wrong. Keeping diagnostics off the main
+ * Four destinations, matching how a field test actually happens: watch the live
+ * pipeline while driving, review what got recorded afterwards (as a list, or played
+ * back on the trajectory view), and dig into raw diagnostics only when something
+ * looks wrong. Keeping diagnostics off the main
  * screen was an explicit call: the person operating the phone during a demo needs
  * four or five numbers, not a debug console.
  *
@@ -60,6 +67,7 @@ import kotlinx.coroutines.launch
 private enum class Tab(val label: String, val title: String, val icon: ImageVector) {
     LIVE("Live", "SIH26 Field Test", Icons.Default.Navigation),
     SESSIONS("Sessions", "Recorded sessions", Icons.Default.List),
+    REPLAY("Replay", "Replay", Icons.Default.PlayArrow),
     DIAGNOSTICS("Diagnostics", "Diagnostics", Icons.Default.Info)
 }
 
@@ -78,6 +86,15 @@ class MainActivity : ComponentActivity() {
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         hasLocationPermission = hasLocationPermission()
+    }
+
+    // The file the person picked for the Replay page. The system document picker needs
+    // no storage permission; this holds the result until the Replay screen has taken it
+    // (see consumePickedReplayUri) so a rotation or tab switch cannot re-trigger a load.
+    private var pickedReplayUri by mutableStateOf<Uri?>(null)
+
+    private val replayPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        pickedReplayUri = uri
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -106,7 +123,11 @@ class MainActivity : ComponentActivity() {
                         blackout = { active -> startService(intent(SessionRecordingService.ACTION_SET_BLACKOUT).putExtra(SessionRecordingService.EXTRA_BLACKOUT_ACTIVE, active)) },
                         listSessions = { SessionStore.open(this).recent() },
                         deleteSession = { SessionStore.open(this).delete(it) },
-                        export = ::export
+                        export = ::export,
+                        pickReplayFile = { replayPicker.launch(arrayOf("*/*")) },
+                        pickedReplayUri = pickedReplayUri,
+                        consumePickedReplayUri = { pickedReplayUri = null },
+                        loadReplayFromUri = ::loadReplay
                     )
                 }
             }
@@ -146,6 +167,17 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    /** Runs on a background thread (see ReplayScreen), so blocking I/O is fine here. */
+    private fun loadReplay(uri: Uri): ReplaySession {
+        val stream = contentResolver.openInputStream(uri) ?: throw IOException("Could not open the selected file.")
+        return stream.use { ReplayLoader.load(it, displayName(uri)) }
+    }
+
+    private fun displayName(uri: Uri): String =
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        } ?: uri.lastPathSegment ?: "Selected file"
+
     private fun intent(action: String) = Intent(this, SessionRecordingService::class.java).setAction(action)
 
     private fun export(file: File) {
@@ -177,9 +209,16 @@ private fun App(
     blackout: (Boolean) -> Unit,
     listSessions: () -> List<SessionRecord>,
     deleteSession: (SessionRecord) -> Unit,
-    export: (File) -> Unit
+    export: (File) -> Unit,
+    pickReplayFile: () -> Unit,
+    pickedReplayUri: Uri?,
+    consumePickedReplayUri: () -> Unit,
+    loadReplayFromUri: (Uri) -> ReplaySession
 ) {
     var tab by remember { mutableStateOf(Tab.LIVE) }
+    // Held here rather than inside the Replay screen so a loaded drive is still there
+    // after visiting another destination from the drawer.
+    var replaySession by remember { mutableStateOf<ReplaySession?>(null) }
     var telemetry by remember { mutableStateOf<SessionRecordingService.RecordingTelemetry?>(null) }
     var frontEndStatus by remember { mutableStateOf("") }
     val trail = remember { mutableStateListOf<TrackPoint>() }
@@ -223,7 +262,7 @@ private fun App(
     val scope = rememberCoroutineScope()
     fun navigate(target: Tab) {
         tab = target
-        if (target == Tab.SESSIONS) records = listSessions()
+        if (target == Tab.SESSIONS || target == Tab.REPLAY) records = listSessions()
         scope.launch { drawerState.close() }
     }
 
@@ -276,6 +315,15 @@ private fun App(
                         deleteSession(record)
                         records = listSessions()
                     }
+                    Tab.REPLAY -> ReplayScreen(
+                        records = records,
+                        session = replaySession,
+                        onSession = { replaySession = it },
+                        pickFile = pickReplayFile,
+                        pickedUri = pickedReplayUri,
+                        consumePickedUri = consumePickedReplayUri,
+                        loadFromUri = loadReplayFromUri
+                    )
                     Tab.DIAGNOSTICS -> DiagnosticsScreen(telemetry, frontEndStatus)
                 }
             }
