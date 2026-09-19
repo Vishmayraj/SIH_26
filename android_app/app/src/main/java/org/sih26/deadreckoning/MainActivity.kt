@@ -17,6 +17,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Navigation
@@ -261,7 +263,12 @@ private fun LiveScreen(
     val recording = t?.recording == true
     var lowStorageWarningMb by remember { mutableStateOf<Long?>(null) }
 
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    // Scrollable: the velocity and road-matching cards below the canvas take this
+    // screen past one phone height while recording.
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
         Text("SIH26 Field Test", style = MaterialTheme.typography.headlineSmall)
 
         if (!hasLocationPermission) {
@@ -643,7 +650,10 @@ private fun SessionCard(r: SessionRecord, export: (File) -> Unit, delete: (Sessi
 
 @Composable
 private fun DiagnosticsScreen(t: SessionRecordingService.RecordingTelemetry?, frontEndStatus: String) {
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
         Text("Diagnostics", style = MaterialTheme.typography.headlineSmall)
         Text(
             "Raw pipeline internals. Nothing here is smoothed for presentation; it is " +
