@@ -1,6 +1,7 @@
 package org.sih26.deadreckoning.ui
 
 import android.graphics.Color as AndroidColor
+import android.view.MotionEvent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -95,11 +96,29 @@ fun TrajectoryCanvas(
             return GeoPoint(ll[0], ll[1])
         }
 
-        val mapView = remember {
+        // Camera bookkeeping that must survive the per-frame recompositions a replay
+        // causes. Keyed on extentPoints so a newly loaded session gets a fresh one.
+        val camera = remember(extentPoints) { CameraState() }
+
+        val mapView = remember(camera) {
             MapView(context).apply {
                 setTileSource(TileSourceFactory.MAPNIK)
                 setMultiTouchControls(true)
                 controller.setZoom(17.0)
+                // The map sits inside a vertically scrolling screen. Without this the
+                // scroll container takes over every drag after a few pixels and the map
+                // never pans; hand the gesture to the map for as long as a finger is down.
+                setOnTouchListener { v, event ->
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            camera.userMoved = true
+                            v.parent?.requestDisallowInterceptTouchEvent(true)
+                        }
+                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                            v.parent?.requestDisallowInterceptTouchEvent(false)
+                    }
+                    false // still let osmdroid handle the event
+                }
             }
         }
 
@@ -132,7 +151,12 @@ fun TrajectoryCanvas(
             drawTrack(TrackKind.FUSED, fusedColor)
             drawTrack(TrackKind.TRUTH, truthColor)
 
-            if (viewPoints.isNotEmpty()) {
+            // Centre the camera, but never fight the person: this block re-runs on every
+            // replay frame, and re-centring each time is what snapped a dragged map back.
+            // A replay centres once on its whole drive; the live view keeps following the
+            // track until the map is first touched.
+            if (viewPoints.isNotEmpty() && !camera.userMoved && (extentPoints == null || !camera.centered)) {
+                camera.centered = true
                 val centerNorth = viewPoints.sumOf { it.north } / viewPoints.size
                 val centerEast = viewPoints.sumOf { it.east } / viewPoints.size
                 view.controller.setCenter(geo(centerNorth, centerEast))
@@ -151,6 +175,12 @@ fun TrajectoryCanvas(
             )
         }
     }
+}
+
+/** Whether the camera has been placed yet, and whether the person has taken it over. */
+private class CameraState {
+    var centered = false
+    var userMoved = false
 }
 
 @Composable
