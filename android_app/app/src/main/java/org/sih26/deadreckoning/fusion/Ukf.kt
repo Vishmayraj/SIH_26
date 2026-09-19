@@ -60,6 +60,17 @@ data class FusionConfig(
 
     val rGnssPos: Double = 3.0,
     val rGnssVel: Double = 0.3,
+    /** When true, zero the cross-covariance between the angular states (psi, ba, bg)
+     * and (vn, ve) immediately before a Channel A/B update. Ported from the Python
+     * reference (ukf.py's `covariance_decoupling`, default true there too): a scalar
+     * speed update has no way to say which direction that speed points, but without
+     * this it can still drag heading and bias around through whatever cross-
+     * covariance the previous cycle's sigma points happened to build up between
+     * speed and psi. That coupling is real information when a *directional*
+     * velocity measurement (old rotated-into-N/E Channel A/B, or GNSS velocity)
+     * supplied it; it is spurious windup once Channel A/B became the scalar
+     * `hxSpeed` measurement below, which asserts nothing about direction at all. */
+    val covarianceDecoupling: Boolean = true,
     val rChannelA: Double = 0.5,
     val rChannelB: Double = 1.75,
     /** GNSS course over ground, 1-sigma in radians. About 3 degrees, the right order
@@ -122,6 +133,13 @@ private fun hxPosition(x: DoubleArray) = doubleArrayOf(x[PN], x[PE])
 private fun hxPositionVelocity(x: DoubleArray) = doubleArrayOf(x[PN], x[PE], x[VN], x[VE])
 
 private fun hxVelocity(x: DoubleArray) = doubleArrayOf(x[VN], x[VE])
+
+/** Scalar speed measurement, independent of heading direction. Matches the Python
+ * reference's `hx_speed`. This is what Channel A/B are measured against now, instead
+ * of the older approach of rotating the scalar speed into (vn, ve) using the filter's
+ * own heading estimate and treating that as a 2-D velocity observation - the old
+ * approach quietly asserted a direction the channel never actually measured. */
+private fun hxSpeed(x: DoubleArray) = doubleArrayOf(hypot(x[VN], x[VE]))
 
 /**
  * Direct heading measurement, for GNSS course over ground.
@@ -324,6 +342,17 @@ class DualChannelUkf(initialState: UkfState, val config: FusionConfig = FusionCo
         )
     }
 
+    /** Zero the cross-covariance between the angular states (psi, ba, bg) and the
+     * Cartesian velocity states (vn, ve). See [FusionConfig.covarianceDecoupling]. */
+    private fun decoupleVelocityFromAngular() {
+        for (angIdx in intArrayOf(PSI, BA, BG)) {
+            for (velIdx in intArrayOf(VN, VE)) {
+                p[angIdx][velIdx] = 0.0
+                p[velIdx][angIdx] = 0.0
+            }
+        }
+    }
+
     /** Regenerate sigma points from the current (just updated) x and P.
      *
      * filterpy reuses the sigma points produced by predict() for every subsequent
@@ -436,22 +465,20 @@ class DualChannelUkf(initialState: UkfState, val config: FusionConfig = FusionCo
             gnssRMultiplier(dt, gnssAvailable = false)
         }
 
-        // Channel A and Channel B are scalar forward speeds, rotated into north/east
-        // using the filter's current heading estimate before being applied.
-        val psiHat = x[PSI]
-
+        // Channel A and Channel B are scalar forward-speed measurements (hxSpeed),
+        // independent of heading direction - see hxSpeed and covarianceDecoupling.
         if (channelASpeed != null) {
             val rA = rChannelAOverride ?: channelAR(channelASpeed, channelBSpeed)
-            val z = doubleArrayOf(channelASpeed * cos(psiHat), channelASpeed * sin(psiHat))
-            update(z, LinAlg.diag(doubleArrayOf(rA * rA, rA * rA)), ::hxVelocity)
+            if (config.covarianceDecoupling) decoupleVelocityFromAngular()
+            update(doubleArrayOf(channelASpeed), LinAlg.diag(doubleArrayOf(rA * rA)), ::hxSpeed)
             symmetrizeP()
             refreshSigmas()
         }
 
         if (channelBSpeed != null) {
             val rB = config.rChannelB
-            val z = doubleArrayOf(channelBSpeed * cos(psiHat), channelBSpeed * sin(psiHat))
-            update(z, LinAlg.diag(doubleArrayOf(rB * rB, rB * rB)), ::hxVelocity)
+            if (config.covarianceDecoupling) decoupleVelocityFromAngular()
+            update(doubleArrayOf(channelBSpeed), LinAlg.diag(doubleArrayOf(rB * rB)), ::hxSpeed)
             symmetrizeP()
         }
 
