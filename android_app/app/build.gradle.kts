@@ -59,6 +59,15 @@ dependencies {
     // of fusion/LinAlg.kt for the reasoning and the parity fixture that stands in
     // for the safety net a trusted library would have provided.
 
+    // Stage 12 (models/stage12/motion_speed_net.py) inference on-device. Full
+    // onnxruntime-android, not the "-mobile" package: the latter requires
+    // converting to ORT format ahead of time and only supports a fixed op subset,
+    // neither of which buys anything for a 57k-parameter model where load time and
+    // binary size were never the concern. Runs the plain .onnx export from
+    // models/stage12/export.py directly - see
+    // android_app/app/src/main/assets/models/ and sensors/MotionSpeedNetOnnx.kt.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.27.0")
+
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }

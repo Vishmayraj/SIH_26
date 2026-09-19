@@ -530,7 +530,11 @@ class SessionRecordingService : Service() {
         gnssSatellitesInView = null
         gnssSatellitesUsed = null
         fusionFailed = false
-        pipeline = FusionPipeline()
+        // Stage 12: loads once per recording start; loadFromAssets never throws, so
+        // a missing/corrupt model degrades to stage12Model = null (Channel P only)
+        // rather than failing the whole recording start. See MotionSpeedNetOnnx's
+        // class doc.
+        pipeline = FusionPipeline(stage12Model = MotionSpeedNetOnnx.loadFromAssets(this))
 
         val (newSessionId, outFile) = sessionStore.newSessionFile()
         sessionId = newSessionId

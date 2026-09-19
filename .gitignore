@@ -70,6 +70,13 @@ cache/
 models/**/weights/*.pth
 models/**/*.pth
 !models/stage12/checkpoints/best_motionspeednet.pth
+
+# Stage 12 ONNX export bundled as an Android asset: *.onnx above excludes
+# generated export artifacts everywhere else in the repo (they're reproducible
+# from the checkpoint above via models/stage12/export.py), but this one has to be
+# committed for Gradle to package it into the APK - there is no export step in the
+# Android build.
+!android_app/app/src/main/assets/models/motionspeednet.onnx
 !models/stage12/config/norm_stats.json
 
 # Scratch and test run outputs

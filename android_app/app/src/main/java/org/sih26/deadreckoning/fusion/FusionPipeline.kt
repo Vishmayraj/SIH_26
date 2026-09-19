@@ -16,9 +16,13 @@ import kotlin.math.max
  *
  *     onImu (100 Hz)  -> leveling -> horizontal accel + yaw rate
  *                     -> ZUPT detector
- *                     -> Channel P integration
+ *                     -> Channel P integration, Stage 12 model (if injected)
  *                     -> UKF step
  *     onGnss (1 Hz)   -> staged for the next IMU cycle, or withheld if blacked out
+ *
+ * Stage 12 (models/stage12/motion_speed_net.py, bridged via [Stage12Channel]) only
+ * takes Channel A's slot away from Channel P during a blackout, and only once its
+ * pre-blackout calibration is trusted - see that class's doc for why.
  *
  * The blackout is a boolean gate on whether a fix reaches the filter. Fixes are
  * always received and always logged. That is the entire experiment: withheld fixes
@@ -41,6 +45,17 @@ data class FusionSnapshot(
     val driftMeters: Double,
     val driftPercent: Double,
     val channelPSpeed: Double?,
+    /** Stage 12's own calibrated speed prediction this cycle, or null when the
+     * model has not produced a trusted prediction yet (still warming up, or its
+     * pre-blackout calibration never saw enough GNSS-available driving). Reported
+     * regardless of [stage12Active] so a field test can see the model's raw
+     * behavior even on cycles where Channel P was the one actually fed to the
+     * UKF. */
+    val stage12SpeedMps: Double?,
+    /** True on cycles where [stage12SpeedMps] (not Channel P) was the value
+     * actually fed into the UKF's Channel A slot - see Stage12Channel's class doc
+     * for the blackout-gating rule. */
+    val stage12Active: Boolean,
     val zuptActive: Boolean,
     val imuRateHz: Double,
     val stepLatencyMs: Double,
@@ -100,6 +115,7 @@ data class PipelineConfig(
     /** Channel P is fed to the filter as Channel A's slot with this override, since
      * its measured R is nothing like Channel A's Section 4.2 target. */
     val useChannelP: Boolean = true,
+    val stage12: Stage12Config = Stage12Config(),
     /** Largest dt a single cycle may claim. A delivery hiccup or a resumed app must
      * not propagate the filter through a ten-second step as though it were one
      * sample. */
@@ -113,7 +129,15 @@ private const val NANOS_PER_SECOND = 1_000_000_000.0
  * linear in the accumulated sample count. */
 private const val AXIS_RECOMPUTE_CYCLES = 100
 
-class FusionPipeline(val config: PipelineConfig = PipelineConfig()) {
+class FusionPipeline(
+    val config: PipelineConfig = PipelineConfig(),
+    /** Optional Stage 12 speed model, injected rather than constructed here so this
+     * file can stay Android-free (see the module doc at the top). Null disables the
+     * channel entirely and the pipeline behaves exactly as before - Channel P is
+     * the only Channel A source, same as prior to this parameter's existence. The
+     * Android-side ONNX-backed implementation lives in the sensors package. */
+    private val stage12Model: Stage12SpeedModel? = null
+) {
 
     var phase: PipelinePhase = PipelinePhase.LEVELING
         private set
@@ -146,6 +170,13 @@ class FusionPipeline(val config: PipelineConfig = PipelineConfig()) {
     private val zuptDetector = ZuptDetector(config.zupt)
 
     private var ukf: DualChannelUkf? = null
+
+    /** Constructed once [leveling] resolves (Stage12Channel needs a fixed mount
+     * estimate to project accel/gyro into the same axis convention the model was
+     * trained on - see that class's doc). Null for the whole session if
+     * [stage12Model] was null, or forever if it was supplied but leveling never
+     * completes (which only happens if the session ends first). */
+    private var stage12Channel: Stage12Channel? = null
 
     /** A second filter that receives no GNSS and no velocity channel during a
      * blackout: the honest "what the phone does today" CTCV coast. Having it on
@@ -212,6 +243,10 @@ class FusionPipeline(val config: PipelineConfig = PipelineConfig()) {
             forwardAxis.discardInterval()
             val current = ukf?.state()
             if (current != null) coastUkf = DualChannelUkf(current, config.fusion)
+            // Freeze Stage 12's affine calibration on pre-blackout data only - see
+            // Stage12Calibration's class doc for why this must not keep refitting
+            // once blackout starts.
+            stage12Channel?.onBlackoutStart()
         } else {
             blackoutStartNs = null
         }
@@ -287,6 +322,8 @@ class FusionPipeline(val config: PipelineConfig = PipelineConfig()) {
                     leveling = MountLeveling.fromStationaryWindow(levelingWindow)
                     levelingTrusted = elapsed >= config.levelingWindowS
                     levelingWindow.clear()
+                    val model = stage12Model
+                    if (model != null) stage12Channel = Stage12Channel(leveling!!, model, config.stage12)
                     phase = PipelinePhase.WAITING_FOR_GNSS
                 }
                 lastImuNs = tNs
@@ -435,25 +472,55 @@ class FusionPipeline(val config: PipelineConfig = PipelineConfig()) {
             gnssVel = null
         }
 
+        // Stage 12 keeps running (predicting, and while GNSS is available and it is
+        // not a blackout, collecting calibration pairs) every cycle regardless of
+        // blackout state - see Stage12Channel's class doc. Whether its output
+        // actually reaches the filter below is decided here, not there: it only
+        // takes Channel A's slot during a blackout, and only once it has a trusted
+        // calibration; Channel P is the fallback otherwise, exactly as before this
+        // channel existed.
+        val stage12Output = stage12Channel?.update(
+            tNs = tNs,
+            accel = accel,
+            gyro = gyro,
+            leveledYawRate = yawRate,
+            gnssSpeed = fix?.speedMps,
+            blackout = blackout
+        )
+        val finalChannelASpeed = stage12Output?.calibratedSpeedMps ?: channelSpeed
+        val finalRChannelA = when {
+            stage12Output != null -> stage12Output.rChannelA
+            channelSpeed != null -> config.physics.rMps
+            else -> null
+        }
+        val finalGyroYaw = stage12Output?.correctedYawRateRadS ?: yawRate
+
         val state = filter.step(
             dt = dt,
-            gyroYaw = yawRate,
-            channelASpeed = channelSpeed,
+            gyroYaw = finalGyroYaw,
+            channelASpeed = finalChannelASpeed,
             channelBSpeed = null,
             gnssPos = gnssPos,
             gnssVel = gnssVel,
-            rChannelAOverride = if (channelSpeed != null) config.physics.rMps else null,
+            rChannelAOverride = finalRChannelA,
             zupt = zuptActive,
             rZupt = config.zupt.rMps,
             gnssHeading = gnssHeading
         )
 
-        // Coast baseline: same gyro, no GNSS, no velocity channel.
+        // Coast baseline: same gyro, no GNSS, no velocity channel, and no Stage 12
+        // yaw correction either - this stays the honest "what the phone does today"
+        // baseline the demo is about, unaffected by anything above.
         val coastState = coastUkf?.step(dt = dt, gyroYaw = yawRate) ?: state
 
         lastLatencyMs = (System.nanoTime() - startedNs) / 1_000_000.0
 
-        val snapshot = buildSnapshot(tNs, state, coastState, channelSpeed, zuptActive)
+        val snapshot = buildSnapshot(
+            tNs, state, coastState, channelSpeed,
+            stage12SpeedMps = stage12Output?.calibratedSpeedMps,
+            stage12Active = stage12Output != null,
+            zuptActive
+        )
         lastSnapshot = snapshot
         return snapshot
     }
@@ -463,6 +530,8 @@ class FusionPipeline(val config: PipelineConfig = PipelineConfig()) {
         state: UkfState,
         coast: UkfState,
         channelSpeed: Double?,
+        stage12SpeedMps: Double?,
+        stage12Active: Boolean,
         zuptActive: Boolean
     ): FusionSnapshot {
         val startNs = sessionStartNs ?: tNs
@@ -514,6 +583,8 @@ class FusionPipeline(val config: PipelineConfig = PipelineConfig()) {
             driftMeters = driftMeters,
             driftPercent = driftPercent,
             channelPSpeed = channelSpeed,
+            stage12SpeedMps = stage12SpeedMps,
+            stage12Active = stage12Active,
             zuptActive = zuptActive,
             imuRateHz = imuRateHz,
             stepLatencyMs = lastLatencyMs,
