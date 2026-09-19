@@ -177,6 +177,11 @@ class SessionRecordingService : Service() {
 
     private var logger: SessionLogger? = null
     private var pipeline: FusionPipeline? = null
+
+    /** Held so [stopRecording]/[onDestroy] can cancel a pending road-network retry and
+     * release its thread; the pipeline only sees it through the RoadNetworkProvider
+     * interface. */
+    private var roadProvider: OverpassRoadNetworkProvider? = null
     private lateinit var sessionStore: SessionStore
     private var sessionId: String? = null
     private var sessionStartedUtc: String = ""
@@ -539,9 +544,12 @@ class SessionRecordingService : Service() {
         // session's first GNSS fix (see CorridorChannel.onFirstFix) - constructing
         // it here just wires the (network-free at construction time) client in, it
         // does not touch the network yet.
+        roadProvider?.close()
+        val provider = OverpassRoadNetworkProvider()
+        roadProvider = provider
         pipeline = FusionPipeline(
             stage12Model = MotionSpeedNetOnnx.loadFromAssets(this),
-            roadNetworkProvider = OverpassRoadNetworkProvider()
+            roadNetworkProvider = provider
         )
 
         val (newSessionId, outFile) = sessionStore.newSessionFile()
@@ -616,6 +624,8 @@ class SessionRecordingService : Service() {
         }
         logger = null
         pipeline = null
+        roadProvider?.close()
+        roadProvider = null
         blackoutActive = false
         releaseWakeLock()
         publishTelemetry()
@@ -637,6 +647,8 @@ class SessionRecordingService : Service() {
         locationManager.removeUpdates(locationListener)
         runCatching { locationManager.unregisterGnssStatusCallback(gnssStatusCallback) }
         logger?.close()
+        roadProvider?.close()
+        roadProvider = null
         releaseWakeLock()
         thread.quitSafely()
         super.onDestroy()

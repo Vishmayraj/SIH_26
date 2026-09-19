@@ -25,12 +25,12 @@ import kotlin.math.max
 
 /**
  * One track sample in the local tangent frame (meters, north/east), tagged by
- * source so the three tracks the field-test milestone calls out - raw GNSS truth,
- * the fused (UKF) estimate, and the no-correction coast baseline - stay visually
- * and semantically separate. Nothing here decides what counts as "true"; it just
+ * source so the tracks the field-test milestone calls out - raw GNSS truth, the fused
+ * (UKF) estimate, the no-correction coast baseline, and the corridor filter's
+ * road-snapped position - stay visually and semantically separate. Nothing here decides what counts as "true"; it just
  * renders whatever [FusionSnapshot] already reports.
  */
-enum class TrackKind { TRUTH, FUSED, COAST }
+enum class TrackKind { TRUTH, FUSED, COAST, CORRIDOR }
 
 data class TrackPoint(val north: Double, val east: Double, val kind: TrackKind)
 
@@ -39,12 +39,21 @@ data class TrackPoint(val north: Double, val east: Double, val kind: TrackKind)
  * network, no dependency risk this close to a deadline. It exists purely to make
  * "is the fused track actually tracking truth, and is that materially better than
  * doing nothing" visible at a glance during a blackout demo.
+ *
+ * [road] is the OSM road polyline the corridor filter locked onto (North/East metres,
+ * from FusionSnapshot.corridorRoad). It is drawn as an underlay only and never widens
+ * the view: the extent comes from the tracks alone, so a chained road that runs for
+ * kilometres cannot shrink the track to a dot. Segments outside the view are skipped.
  */
 @Composable
-fun TrajectoryCanvas(points: List<TrackPoint>, modifier: Modifier = Modifier) {
+fun TrajectoryCanvas(points: List<TrackPoint>, modifier: Modifier = Modifier, road: List<DoubleArray>? = null) {
     val truthColor = Color(0xFF2E7D32)   // GNSS ground truth - green
     val fusedColor = Color(0xFF1565C0)   // UKF fused estimate - blue
     val coastColor = Color(0xFFE65100)   // no-correction coast baseline - orange
+    val corridorColor = Color(0xFF8E24AA) // corridor road-snapped position - purple
+    val roadColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
+    val hasCorridorTrack = points.any { it.kind == TrackKind.CORRIDOR }
+    val hasRoad = road != null && road.size >= 2
 
     Box(modifier.fillMaxWidth().height(220.dp).background(MaterialTheme.colorScheme.surfaceVariant)) {
         if (points.size < 2) {
@@ -94,24 +103,47 @@ fun TrajectoryCanvas(points: List<TrackPoint>, modifier: Modifier = Modifier) {
                 drawCircle(color, radius = 8f, center = head)
             }
 
+            // The road goes first so every track sits on top of it.
+            if (road != null && road.size >= 2) {
+                val w = size.width
+                val h = size.height
+                var prev = project(road[0][0], road[0][1])
+                for (i in 1 until road.size) {
+                    val cur = project(road[i][0], road[i][1])
+                    val offscreen = (prev.x < 0f && cur.x < 0f) || (prev.x > w && cur.x > w) ||
+                        (prev.y < 0f && cur.y < 0f) || (prev.y > h && cur.y > h)
+                    if (!offscreen) {
+                        drawLine(color = roadColor, start = prev, end = cur, strokeWidth = 16f, cap = StrokeCap.Round)
+                    }
+                    prev = cur
+                }
+            }
+
             // Draw order matters only for overlap legibility, not meaning: coast
             // first (it is expected to diverge most and should not hide the others).
             drawTrack(TrackKind.COAST, coastColor, dashed = true)
+            drawTrack(TrackKind.CORRIDOR, corridorColor, dashed = false)
             drawTrack(TrackKind.FUSED, fusedColor, dashed = false)
             drawTrack(TrackKind.TRUTH, truthColor, dashed = false)
         }
         Box(Modifier.align(Alignment.TopStart).padding(8.dp)) {
-            Legend(truthColor, fusedColor, coastColor)
+            Legend(
+                truthColor, fusedColor, coastColor,
+                corridor = if (hasCorridorTrack) corridorColor else null,
+                road = if (hasRoad) roadColor else null
+            )
         }
     }
 }
 
 @Composable
-private fun Legend(truth: Color, fused: Color, coast: Color) {
+private fun Legend(truth: Color, fused: Color, coast: Color, corridor: Color?, road: Color?) {
     Column {
         LegendRow(truth, "GNSS truth (withheld during blackout, still plotted)")
         LegendRow(fused, "Fused (UKF)")
         LegendRow(coast, "Coast baseline (no correction)")
+        if (corridor != null) LegendRow(corridor, "Corridor (road-snapped)")
+        if (road != null) LegendRow(road, "Locked OSM road")
     }
 }
 

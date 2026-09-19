@@ -84,6 +84,19 @@ data class FusionSnapshot(
      * outer UKF's own pre-correction position estimate this cycle - how hard the
      * road match is pulling, for display only. Null unless a road is locked on. */
     val corridorPositionCorrectionM: Double?,
+    /** The corridor filter's own road-snapped North/East position this cycle, whether
+     * or not it was confident enough to reach the outer UKF ([corridorActive]).
+     * Null unless a road is locked on and the channel produced output this cycle. */
+    val corridorMatchedNorth: Double?,
+    val corridorMatchedEast: Double?,
+    /** Vertices ([North, East] metres) of the chained road polyline the corridor is
+     * tracking along, for drawing. The same list instance every cycle of a blackout -
+     * hold it by reference, do not mutate it. Null when no road is locked. */
+    val corridorRoad: List<DoubleArray>?,
+    /** Progress of the one-shot OSM fetch behind the corridor; IDLE if no provider
+     * was injected. Lets the UI say why no road is locked (offline / still loading /
+     * gave up) rather than only that none is. */
+    val roadNetworkStatus: RoadNetworkStatus,
     val zuptActive: Boolean,
     val imuRateHz: Double,
     val stepLatencyMs: Double,
@@ -611,6 +624,7 @@ class FusionPipeline(
             corridorActive = corridorOutput != null &&
                 corridorOutput.confidence >= config.fusion.roadSignatureConfidenceThreshold,
             corridorPositionCorrectionM = corridorOutput?.correctionMagnitudeM,
+            corridorMatchedNorthEast = corridorOutput?.positionNorthEast,
             zuptActive
         )
         lastSnapshot = snapshot
@@ -628,6 +642,7 @@ class FusionPipeline(
         corridorConfidence: Double,
         corridorActive: Boolean,
         corridorPositionCorrectionM: Double?,
+        corridorMatchedNorthEast: DoubleArray?,
         zuptActive: Boolean
     ): FusionSnapshot {
         val startNs = sessionStartNs ?: tNs
@@ -685,6 +700,10 @@ class FusionPipeline(
             corridorConfidence = corridorConfidence,
             corridorActive = corridorActive,
             corridorPositionCorrectionM = corridorPositionCorrectionM,
+            corridorMatchedNorth = corridorMatchedNorthEast?.get(0),
+            corridorMatchedEast = corridorMatchedNorthEast?.get(1),
+            corridorRoad = corridorChannel?.lockedRoadPoints,
+            roadNetworkStatus = corridorChannel?.networkStatus() ?: RoadNetworkStatus(RoadNetworkState.IDLE),
             zuptActive = zuptActive,
             imuRateHz = imuRateHz,
             stepLatencyMs = lastLatencyMs,

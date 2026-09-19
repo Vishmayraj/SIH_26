@@ -29,7 +29,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import org.sih26.deadreckoning.fusion.FusionSnapshot
 import org.sih26.deadreckoning.fusion.PipelinePhase
+import org.sih26.deadreckoning.fusion.RoadNetworkState
+import org.sih26.deadreckoning.fusion.RoadNetworkStatus
 import org.sih26.deadreckoning.sensors.SessionRecordingService
 import org.sih26.deadreckoning.sessions.SessionRecord
 import org.sih26.deadreckoning.sessions.SessionStore
@@ -167,6 +170,10 @@ private fun App(
     var telemetry by remember { mutableStateOf<SessionRecordingService.RecordingTelemetry?>(null) }
     var frontEndStatus by remember { mutableStateOf("") }
     val trail = remember { mutableStateListOf<TrackPoint>() }
+    // The OSM road the corridor filter last locked onto. Kept after the blackout ends
+    // (the snapshot's own copy goes null then) so the drive can still be reviewed
+    // against the road it was matched to; cleared when a new recording starts.
+    var road by remember { mutableStateOf<List<DoubleArray>?>(null) }
     var records by remember { mutableStateOf(listSessions()) }
 
     DisposableEffect(Unit) {
@@ -177,10 +184,19 @@ private fun App(
                 trail.add(TrackPoint(snap.lastTruthNorth, snap.lastTruthEast, TrackKind.TRUTH))
                 trail.add(TrackPoint(snap.fusedNorth, snap.fusedEast, TrackKind.FUSED))
                 trail.add(TrackPoint(snap.coastNorth, snap.coastEast, TrackKind.COAST))
+                // Only present while the corridor filter has a road locked on.
+                val matchedN = snap.corridorMatchedNorth
+                val matchedE = snap.corridorMatchedEast
+                if (matchedN != null && matchedE != null) {
+                    trail.add(TrackPoint(matchedN, matchedE, TrackKind.CORRIDOR))
+                }
+                snap.corridorRoad?.let { if (road !== it) road = it }
                 // Cap the trail so a long drive does not grow the canvas's per-frame
-                // work without bound; 5 Hz telemetry * 3 points/sample means ~10
-                // minutes of history before the oldest points start dropping.
-                while (trail.size > 9000) repeat(3) { trail.removeAt(0) }
+                // work without bound: 12000 points is ~10 minutes of history at 5 Hz
+                // telemetry with all four tracks present, oldest dropped first. Point
+                // count per sample varies now (the corridor track comes and goes), so
+                // this trims by total size rather than in fixed groups of three.
+                while (trail.size > 12000) trail.removeAt(0)
             }
         }
         SessionRecordingService.statusListener = { frontEndStatus = it }
@@ -200,14 +216,14 @@ private fun App(
         Box(Modifier.padding(padding)) {
             when (tab) {
                 Tab.LIVE -> LiveScreen(
-                    t = telemetry, trail = trail,
+                    t = telemetry, trail = trail, road = road,
                     hasLocationPermission = hasLocationPermission,
                     requestPermission = requestPermission,
                     openAppSettings = openAppSettings,
                     freeStorageBytes = freeStorageBytes,
                     ignoringBatteryOptimizations = ignoringBatteryOptimizations,
                     requestIgnoreBatteryOptimizations = requestIgnoreBatteryOptimizations,
-                    start = { trail.clear(); start() }, stop = stop, blackout = blackout
+                    start = { trail.clear(); road = null; start() }, stop = stop, blackout = blackout
                 )
                 Tab.SESSIONS -> SessionsScreen(records, export) { record ->
                     deleteSession(record)
@@ -231,6 +247,7 @@ private const val MIN_FREE_STORAGE_BYTES = 50L * 1024 * 1024
 private fun LiveScreen(
     t: SessionRecordingService.RecordingTelemetry?,
     trail: List<TrackPoint>,
+    road: List<DoubleArray>?,
     hasLocationPermission: Boolean,
     requestPermission: () -> Unit,
     openAppSettings: () -> Unit,
@@ -324,7 +341,7 @@ private fun LiveScreen(
             ErrorBanner("The on-device fused track has stopped updating after an internal error. Raw sensor/GNSS logging is unaffected and this drive is still worth keeping.")
         }
 
-        TrajectoryCanvas(trail, Modifier.fillMaxWidth())
+        TrajectoryCanvas(trail, Modifier.fillMaxWidth(), road)
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -347,7 +364,10 @@ private fun LiveScreen(
             }
         }
 
-        t?.snapshot?.let { snap -> VelocityChannelCard(snap, t.blackout) }
+        t?.snapshot?.let { snap ->
+            VelocityChannelCard(snap, t.blackout)
+            RoadMatchingCard(snap, t.blackout)
+        }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column {
@@ -360,49 +380,95 @@ private fun LiveScreen(
 }
 
 /**
- * Which velocity channel is actually feeding the UKF's Channel A slot right now,
- * and what the road-matching corridor filter (if a road was locked on) thinks the
- * position correction looks like. This is the one thing a judge watching a live
- * blackout demo needs on screen without digging into Diagnostics: Channel P alone
- * used to be silently invisible outside that tab (see FusionSnapshot.channelPSpeed's
- * doc, pre-Stage-12), and Stage 12 / corridor status had no UI surface at all until
- * this card - both were already flowing through FusionSnapshot, just unread.
+ * Which speed source is feeding the UKF's Channel A slot right now. Mirrors the
+ * pipeline's own rule (`finalChannelASpeed = stage12 ?: channelP`): Channel P is
+ * applied every cycle it has a value, GNSS live or not (it reseeds from each fix and
+ * integrates in between), and Stage 12 takes the slot over only during a blackout
+ * once its pre-blackout calibration is trusted. The corridor is not a speed source
+ * and lives in [RoadMatchingCard].
  *
  * Only shown while a session is running (the caller gates on t?.snapshot being
  * non-null), so there is nothing to render before the filter initialises.
  */
 @Composable
-private fun VelocityChannelCard(snap: org.sih26.deadreckoning.fusion.FusionSnapshot, blackout: Boolean) {
+private fun VelocityChannelCard(snap: FusionSnapshot, blackout: Boolean) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("Velocity channels", style = MaterialTheme.typography.titleSmall)
             ChannelStatusRow(
                 name = "Channel P (physics)",
                 valueText = snap.channelPSpeed?.let { "${fmt(it)} m/s" } ?: "not resolved",
-                active = blackout && !snap.stage12Active && !snap.corridorActive && snap.channelPSpeed != null
+                active = snap.channelPSpeed != null && !snap.stage12Active
             )
             ChannelStatusRow(
                 name = "Stage 12 (MotionSpeedNet)",
-                valueText = snap.stage12SpeedMps?.let { "${fmt(it)} m/s" } ?: "warming up / not calibrated",
+                valueText = when {
+                    snap.stage12SpeedMps != null -> "${fmt(snap.stage12SpeedMps)} m/s"
+                    blackout -> "warming up / not calibrated"
+                    else -> "standby - blackout only"
+                },
                 active = snap.stage12Active
             )
-            ChannelStatusRow(
-                name = "Corridor (road-matched)",
-                valueText = if (snap.corridorRoadLocked) {
-                    "conf ${fmt(snap.corridorConfidence * 100)}%" + (snap.corridorPositionCorrectionM?.let { " - ${fmt(it)} m correction" } ?: "")
+            Text(
+                if (blackout) {
+                    if (snap.stage12Active) "Stage 12 is feeding the filter; Channel P is the fallback."
+                    else "Channel P is feeding the filter; Stage 12 has no trusted prediction yet."
                 } else {
-                    "no road locked"
+                    "GNSS is live: Channel P feeds the filter (reseeded from each fix). " +
+                        "Stage 12 only takes over during a blackout."
                 },
-                active = snap.corridorActive
+                style = MaterialTheme.typography.labelSmall
             )
-            if (!blackout) {
-                Text(
-                    "GNSS is live - these are shown for visibility only; none of them feed the filter.",
-                    style = MaterialTheme.typography.labelSmall
+        }
+    }
+}
+
+/**
+ * The OSM road-matching corridor: whether the road network downloaded, whether a road
+ * got locked at blackout start, how well the turn signature matches it, and whether
+ * the road-snapped position is actually being applied to the filter.
+ */
+@Composable
+private fun RoadMatchingCard(snap: FusionSnapshot, blackout: Boolean) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Road matching (OSM)", style = MaterialTheme.typography.titleSmall)
+            ChannelStatusRow(
+                name = "Road network",
+                valueText = roadNetworkText(snap.roadNetworkStatus),
+                active = snap.roadNetworkStatus.state == RoadNetworkState.READY
+            )
+            ChannelStatusRow(
+                name = "Road lock",
+                valueText = when {
+                    snap.corridorRoadLocked -> "locked - conf ${fmt(snap.corridorConfidence * 100)}%"
+                    blackout -> "not locked (no road in range at blackout start)"
+                    else -> "locks when a blackout starts"
+                },
+                active = snap.corridorRoadLocked
+            )
+            if (snap.corridorRoadLocked) {
+                ChannelStatusRow(
+                    name = "Position correction",
+                    valueText = if (snap.corridorActive) {
+                        "applied" + (snap.corridorPositionCorrectionM?.let { " - ${fmt(it)} m pull" } ?: "")
+                    } else {
+                        "held back (confidence too low)" +
+                            (snap.corridorPositionCorrectionM?.let { " - ${fmt(it)} m off road" } ?: "")
+                    },
+                    active = snap.corridorActive
                 )
             }
         }
     }
+}
+
+private fun roadNetworkText(status: RoadNetworkStatus): String = when (status.state) {
+    RoadNetworkState.IDLE -> "waiting for first GNSS fix"
+    RoadNetworkState.FETCHING -> "downloading roads..."
+    RoadNetworkState.RETRYING -> "no data yet - retrying (${status.attempt} failed)"
+    RoadNetworkState.READY -> "ready - ${status.segmentCount} segments"
+    RoadNetworkState.FAILED -> "unavailable after ${status.attempt} tries - corridor off"
 }
 
 @Composable
@@ -602,9 +668,16 @@ private fun DiagnosticsScreen(t: SessionRecordingService.RecordingTelemetry?, fr
                     DiagRow("Channel P speed", snap.channelPSpeed?.let { "${fmt(it)} m/s" } ?: "not resolved")
                     DiagRow("Stage 12 speed", snap.stage12SpeedMps?.let { "${fmt(it)} m/s" } ?: "not resolved")
                     DiagRow("Stage 12 feeding UKF this cycle", if (snap.stage12Active) "yes" else "no")
+                    DiagRow("Road network (OSM)", roadNetworkText(snap.roadNetworkStatus))
                     DiagRow("Corridor road locked", if (snap.corridorRoadLocked) "yes" else "no")
                     DiagRow("Corridor progress confidence", "${fmt(snap.corridorConfidence * 100)}%")
                     DiagRow("Corridor feeding UKF this cycle", if (snap.corridorActive) "yes" else "no")
+                    DiagRow(
+                        "Corridor matched position (N,E)",
+                        if (snap.corridorMatchedNorth != null && snap.corridorMatchedEast != null) {
+                            "${fmt(snap.corridorMatchedNorth)}, ${fmt(snap.corridorMatchedEast)} m"
+                        } else "n/a"
+                    )
                     DiagRow("Fused position (N,E)", "${fmt(snap.fusedNorth)}, ${fmt(snap.fusedEast)} m")
                     DiagRow("Coast position (N,E)", "${fmt(snap.coastNorth)}, ${fmt(snap.coastEast)} m")
                     DiagRow("Truth position (N,E)", "${fmt(snap.lastTruthNorth)}, ${fmt(snap.lastTruthEast)} m")

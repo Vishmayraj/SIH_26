@@ -313,6 +313,33 @@ class RoadProgressMatcher(road: CorridorRoad) {
     }
 }
 
+/** Where the one-shot road-network fetch is in its lifecycle. Display-only: nothing in
+ * the fusion path branches on it (a missing network already just means "no road
+ * locked" via [RoadNetworkProvider.currentNetwork] returning null), it exists so the
+ * UI can say *why* the corridor is silent instead of leaving "no road locked" to
+ * cover offline, still-loading and nothing-mapped-here alike. */
+enum class RoadNetworkState {
+    /** No fetch requested yet (no GNSS fix so far this session). */
+    IDLE,
+    /** First attempt in flight. */
+    FETCHING,
+    /** An earlier attempt failed and a later one is scheduled or in flight. */
+    RETRYING,
+    /** A network is available to [CorridorChannel.onBlackoutStart]. */
+    READY,
+    /** Every attempt failed; the corridor stays silent for the rest of the session. */
+    FAILED
+}
+
+data class RoadNetworkStatus(
+    val state: RoadNetworkState,
+    /** Segments in the fetched network; 0 unless [state] is [RoadNetworkState.READY]. */
+    val segmentCount: Int = 0,
+    /** Attempts so far: 0 while IDLE, 1 while FETCHING, the number that have already
+     * FAILED while RETRYING, and the number used in total for READY / FAILED. */
+    val attempt: Int = 0
+)
+
 /** The OSM-fetching boundary. Implemented against Overpass in the sensors package
  * (`OverpassRoadNetworkProvider`); kept as an interface here so [CorridorChannel]
  * is testable without network access, same split as [Stage12SpeedModel]. */
@@ -328,6 +355,18 @@ interface RoadNetworkProvider {
     /** The most recently completed fetch's network, or null if none has completed
      * yet (still pending, or every attempt so far failed). Never throws. */
     fun currentNetwork(): RoadNetwork?
+
+    /** Display-only fetch progress. The default derives READY/IDLE from
+     * [currentNetwork] alone, so a provider that cannot report retries or failures
+     * (a test fake, say) needs no changes. */
+    fun status(): RoadNetworkStatus {
+        val network = currentNetwork()
+        return if (network != null) {
+            RoadNetworkStatus(RoadNetworkState.READY, network.segments.size, attempt = 1)
+        } else {
+            RoadNetworkStatus(RoadNetworkState.IDLE)
+        }
+    }
 }
 
 /** Output of one blackout's corridor tracking, ready to hand to [DualChannelUkf.step]
@@ -372,7 +411,17 @@ class CorridorChannel(private val roadNetworkProvider: RoadNetworkProvider) {
     private var requestedFetch = false
     private var corridorFilter: CorridorFilterState? = null
     private var roadMatcher: RoadProgressMatcher? = null
+    private var lockedRoad: CorridorRoad? = null
     private var cumImuTurn = 0.0
+
+    /** Vertices ([North, East] metres) of the chained road polyline this blackout is
+     * tracking along, or null when no road is locked. Same list instance for the whole
+     * blackout, so a caller can hold it by reference without copying per cycle. Callers
+     * must treat it as read-only. */
+    val lockedRoadPoints: List<DoubleArray>? get() = lockedRoad?.points
+
+    /** Progress of the road-network fetch behind this channel, display-only. */
+    fun networkStatus(): RoadNetworkStatus = roadNetworkProvider.status()
 
     /** Whether a candidate road is currently locked on for this blackout (i.e.
      * [update] can produce output). False before the first blackout, after a
@@ -403,12 +452,14 @@ class CorridorChannel(private val roadNetworkProvider: RoadNetworkProvider) {
         cumImuTurn = 0.0
         corridorFilter = null
         roadMatcher = null
+        lockedRoad = null
 
         val network = roadNetworkProvider.currentNetwork() ?: return
         val candidates = network.getNearbySegments(pos, radius = 50.0)
         val best = candidates.minByOrNull { it.dist } ?: return
 
         val road = CorridorRoad(network.segments, initialIndex = best.index)
+        lockedRoad = road
         roadMatcher = RoadProgressMatcher(road)
         corridorFilter = CorridorFilterState(road, sInit = 0.0, vInit = max(0.0, initialSpeed))
     }
@@ -420,6 +471,7 @@ class CorridorChannel(private val roadNetworkProvider: RoadNetworkProvider) {
     fun onBlackoutEnd() {
         corridorFilter = null
         roadMatcher = null
+        lockedRoad = null
     }
 
     /** Call once per UKF cycle during a blackout, after the outer filter's own

@@ -8,16 +8,26 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 import kotlin.math.cos
 import org.json.JSONArray
 import org.json.JSONObject
 import org.sih26.deadreckoning.fusion.LocalFrame
 import org.sih26.deadreckoning.fusion.RoadNetwork
 import org.sih26.deadreckoning.fusion.RoadNetworkProvider
+import org.sih26.deadreckoning.fusion.RoadNetworkState
+import org.sih26.deadreckoning.fusion.RoadNetworkStatus
 import org.sih26.deadreckoning.fusion.RoadSegment
 
 private const val TAG = "OverpassRoadNetwork"
 private const val OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+/** Wait before the 2nd, 3rd and 4th attempt. A session that starts before mobile data
+ * has attached (or in a dead spot) should still get a road network once connectivity
+ * returns, but hammering the public Overpass instance is not acceptable behaviour
+ * either, hence a short bounded ladder rather than a fixed-interval loop. */
+private val RETRY_DELAYS_S = longArrayOf(10, 30, 60)
 
 /**
  * Overpass API-backed [RoadNetworkProvider]: the only Android-specific piece of the
@@ -36,21 +46,24 @@ private const val OVERPASS_URL = "https://overpass-api.de/api/interpreter"
  * car can drive on - excludes footways, cycleways, unclassified-but-pedestrian
  * paths, etc; includes the `_link` slip-road variants).
  *
- * Fetches once per session (`requestAround` no-ops on any call after the first that
- * succeeds or is in flight), on a single background thread, and never throws back
- * into the caller - every failure mode (no connectivity, Overpass timeout/rate
- * limit, malformed response) leaves `currentNetwork()` returning null, which
- * `CorridorChannel` treats exactly like "not fetched yet": the channel stays silent
- * for the session and `FusionPipeline` runs on Channel P / Stage 12 alone, same as
- * if this provider had never been constructed.
+ * Fetches once per session (`requestAround` no-ops on any call after the first), on a
+ * single background thread, retrying a failed attempt up to three more times on a
+ * 10 s / 30 s / 60 s ladder, and never throws back into the caller - every failure
+ * mode (no connectivity, Overpass timeout/rate limit, malformed response) leaves
+ * `currentNetwork()` returning null, with [status] saying whether that is "still
+ * trying" or "gave up". `CorridorChannel` treats a null network exactly like "not
+ * fetched yet": the channel stays silent and `FusionPipeline` runs on Channel P /
+ * Stage 12 alone, same as if this provider had never been constructed.
  */
 class OverpassRoadNetworkProvider : RoadNetworkProvider {
 
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor = Executors.newSingleThreadScheduledExecutor()
 
     @Volatile private var fetchStarted = false
 
     @Volatile private var network: RoadNetwork? = null
+
+    @Volatile private var status = RoadNetworkStatus(RoadNetworkState.IDLE)
 
     override fun requestAround(lat: Double, lon: Double, frame: LocalFrame, radiusM: Double) {
         // Single-flight: the first caller (FusionPipeline.onGnss, on the session's
@@ -61,22 +74,66 @@ class OverpassRoadNetworkProvider : RoadNetworkProvider {
         // paper over.
         if (fetchStarted) return
         fetchStarted = true
+        status = RoadNetworkStatus(RoadNetworkState.FETCHING, attempt = 1)
+        try {
+            executor.execute { runAttempt(lat, lon, frame, radiusM, attempt = 1) }
+        } catch (e: RejectedExecutionException) {
+            // close() already ran (session stopped between the first fix and here).
+            status = RoadNetworkStatus(RoadNetworkState.FAILED, attempt = 1)
+        }
+    }
 
-        executor.execute {
+    /** One fetch attempt, always on the executor thread. A failure schedules the next
+     * attempt on the same thread after [RETRY_DELAYS_S], or gives up for the session
+     * once the ladder is exhausted. Never throws. */
+    private fun runAttempt(lat: Double, lon: Double, frame: LocalFrame, radiusM: Double, attempt: Int) {
+        status = if (attempt == 1) {
+            RoadNetworkStatus(RoadNetworkState.FETCHING, attempt = 1)
+        } else {
+            RoadNetworkStatus(RoadNetworkState.RETRYING, attempt = attempt - 1)
+        }
+        try {
+            val bbox = boundingBox(lat, lon, radiusM)
+            val query = buildQuery(bbox)
+            val json = postOverpassQuery(query)
+            val segments = parseSegments(json, frame)
+            network = RoadNetwork(segments)
+            status = RoadNetworkStatus(RoadNetworkState.READY, segments.size, attempt)
+            Log.i(TAG, "Corridor road network ready: ${segments.size} segments within ${radiusM.toInt()} m of start (attempt $attempt).")
+        } catch (e: Exception) {
+            val nextDelayS = RETRY_DELAYS_S.getOrNull(attempt - 1)
+            if (nextDelayS == null) {
+                status = RoadNetworkStatus(RoadNetworkState.FAILED, attempt = attempt)
+                Log.e(TAG, "Road network fetch failed after $attempt attempts; corridor matching disabled for this session.", e)
+                return
+            }
+            status = RoadNetworkStatus(RoadNetworkState.RETRYING, attempt = attempt)
+            Log.w(TAG, "Road network fetch attempt $attempt failed; retrying in ${nextDelayS}s.", e)
             try {
-                val bbox = boundingBox(lat, lon, radiusM)
-                val query = buildQuery(bbox)
-                val json = postOverpassQuery(query)
-                val segments = parseSegments(json, frame)
-                network = RoadNetwork(segments)
-                Log.i(TAG, "Corridor road network ready: ${segments.size} segments within ${radiusM.toInt()} m of start.")
-            } catch (e: Exception) {
-                Log.e(TAG, "Road network fetch failed; corridor matching disabled for this session.", e)
+                // Explicit Runnable: a bare lambda is ambiguous between the Runnable and
+                // Callable overloads of schedule().
+                executor.schedule(
+                    Runnable { runAttempt(lat, lon, frame, radiusM, attempt + 1) },
+                    nextDelayS, TimeUnit.SECONDS
+                )
+            } catch (rejected: RejectedExecutionException) {
+                // close() ran while this attempt was in flight - the session is over.
+                status = RoadNetworkStatus(RoadNetworkState.FAILED, attempt = attempt)
             }
         }
     }
 
+    /** Cancels any pending retry and releases the fetch thread. Idempotent. Called by
+     * the recording service when a session ends: this provider is constructed per
+     * session, so without it every recording would leave one idle thread behind (and
+     * a pending retry could fire after the session it was for had already ended). */
+    fun close() {
+        executor.shutdownNow()
+    }
+
     override fun currentNetwork(): RoadNetwork? = network
+
+    override fun status(): RoadNetworkStatus = status
 
     /** [south, west, north, east] in degrees, padded generously around ([lat],
      * [lon]) - matches map_provider.py's own 0.01-degree pad philosophy, just
